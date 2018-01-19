@@ -52,47 +52,60 @@ getCurrentRun = do
     , crWorkingDirectory = workingDirectory
     }
 
-configDirectory :: CurrentRun -> FilePath
-configDirectory cr = crWorkingDirectory cr </> "config"
+data NodeConfig = NodeConfig
+  { ncCurrentRun           :: CurrentRun
+  , ncName                 :: String
+  , ncIsMasterEligibleNode :: Bool
+  , ncIsDataNode           :: Bool
+  , ncHttpPort             :: Int
+  , ncPublishPort          :: Int
+  }
 
-stdoutPath :: CurrentRun -> FilePath
-stdoutPath cr = crWorkingDirectory cr </> "stdout.log"
+stdoutPath :: NodeConfig -> FilePath
+stdoutPath nc = nodeWorkingDirectory nc </> "stdout.log"
 
-stderrPath :: CurrentRun -> FilePath
-stderrPath cr = crWorkingDirectory cr </> "stderr.log"
+stderrPath :: NodeConfig -> FilePath
+stderrPath nc = nodeWorkingDirectory nc </> "stderr.log"
 
-sourceConfig :: Monad m => CurrentRun -> Producer m B.ByteString
-sourceConfig cr = mapM_ yieldString 
-  [ "cluster.name: " ++ crName cr
-  , "node.name: data-1"
-  , "discovery.zen.minimum_master_nodes: 1"
-  , "node.master: true"
-  , "node.data: true"
-  , "path.data: " ++ (crWorkingDirectory cr </> "data")
-  , "path.logs: " ++ (crWorkingDirectory cr </> "logs")
+nodeWorkingDirectory :: NodeConfig -> FilePath
+nodeWorkingDirectory nc = crWorkingDirectory (ncCurrentRun nc) </> ncName nc
+
+configDirectory :: NodeConfig -> FilePath
+configDirectory nc = nodeWorkingDirectory nc </> "config"
+
+sourceConfig :: Monad m => [Int] -> NodeConfig -> Producer m B.ByteString
+sourceConfig otherNodePorts nc = mapM_ yieldString
+  [ "cluster.name: " ++ crName (ncCurrentRun nc)
+  , "node.name: " ++ ncName nc
+  , "discovery.zen.minimum_master_nodes: 2"
+  , "node.master: " ++ if ncIsDataNode nc then "true" else "false"
+  , "node.data: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
+  , "path.data: " ++ (nodeWorkingDirectory nc </> "data")
+  , "path.logs: " ++ (nodeWorkingDirectory nc </> "logs")
   , "network.host: 127.0.0.1"
-  , "http.port: 9201"
-  , "discovery.zen.ping.unicast.hosts: []"
+  , "http.port: " ++ show (ncHttpPort nc)
+  , "transport.tcp.port: " ++ show (ncPublishPort nc)
+  , "discovery.zen.ping.unicast.hosts: " ++ show [ "127.0.0.1:" ++ show p | p <- otherNodePorts ]
   ]
   where yieldString :: Monad m => String -> Producer m B.ByteString
         yieldString = yield . T.encodeUtf8 . T.pack . (++ "\n")
 
-makeConfig :: CurrentRun -> IO ()
-makeConfig cr = do
-  createDirectoryIfMissing True $ configDirectory cr
+makeConfig :: [Int] -> NodeConfig -> IO ()
+makeConfig otherNodePorts nc = do
+  createDirectoryIfMissing True $ configDirectory nc
 
   runResourceT $ runConduit
      $  sourceFile "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/config/log4j2.properties"
-    =$= sinkFile   (configDirectory cr </> "log4j2.properties")
+    =$= sinkFile   (configDirectory nc </> "log4j2.properties")
 
   runResourceT $ runConduit
      $  sourceFile "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/config/jvm.options"
-    =$= sinkFile   (configDirectory cr </> "jvm.options")
+    =$= sinkFile   (configDirectory nc </> "jvm.options")
 
   runResourceT $ runConduit
-     $  sourceConfig cr
+     $  sourceConfig otherNodePorts nc
     =$= writeToConsole
-    =$= sinkFile   (configDirectory cr </> "elasticsearch.yml")
+    =$= sinkFile   (configDirectory nc </> "elasticsearch.yml")
 
 writeToConsole :: MonadIO m => ConduitM B.ByteString B.ByteString m ()
 writeToConsole = awaitForever $ \bs -> do
@@ -112,62 +125,77 @@ main :: IO ()
 main = do
 
   currentRun <- getCurrentRun
+  let nodeConfigs
+        = [ NodeConfig
+            { ncCurrentRun           = currentRun
+            , ncName                 = (if isMaster then "master-" else "data-") ++ show nodeIndex
+            , ncIsMasterEligibleNode = isMaster
+            , ncIsDataNode           = not isMaster
+            , ncHttpPort             = 9200 + nodeIndex
+            , ncPublishPort          = 9300 + nodeIndex
+            }
+          | nodeIndex <- [1..6]
+          , let isMaster = nodeIndex <= 3
+          ]
 
   javaHome <- lookupEnv "JAVA_HOME"
 
-  makeConfig currentRun
+  nodeManagers <- forM nodeConfigs $ \nodeConfig -> do
 
-  withFile   (stdoutPath currentRun) WriteMode $ \stdoutLog -> 
-    withFile (stderrPath currentRun) WriteMode $ \stderrLog -> do
+    makeConfig (map ncPublishPort nodeConfigs) nodeConfig
 
-    saidStartedVar <- newEmptyMVar
+    async $
+      withFile (stdoutPath nodeConfig) WriteMode $ \stdoutLog ->
+      withFile (stderrPath nodeConfig) WriteMode $ \stderrLog -> do
 
-    let cp0 = proc "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/bin/elasticsearch" []
-        cp = cp0
-          { cwd = Just $ crWorkingDirectory currentRun
-          , env = mkEnv $
-              [("ES_PATH_CONF", Just $ configDirectory currentRun)
-              ,("JAVA_HOME", javaHome)]
-          }
+      saidStartedVar <- newEmptyMVar
 
-        consumerStdout :: Consumer B.ByteString IO ()
-        consumerStdout = writeToConsole =$= checkStarted (putMVar saidStartedVar ())
-                                        =$= sinkHandle stdoutLog
+      let cp0 = proc "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/bin/elasticsearch" []
+          cp = cp0
+            { cwd = Just $ crWorkingDirectory currentRun
+            , env = mkEnv $
+                [("ES_PATH_CONF", Just $ configDirectory nodeConfig)
+                ,("JAVA_HOME", javaHome)]
+            }
 
-        consumerStderr :: Consumer B.ByteString IO ()
-        consumerStderr = writeToConsole =$= sinkHandle stderrLog
+          consumerStdout :: Consumer B.ByteString IO ()
+          consumerStdout = writeToConsole =$= checkStarted (putMVar saidStartedVar ())
+                                          =$= sinkHandle stdoutLog
 
-    (  ClosedStream
-     , (sourceStdout, closeStdout)
-     , (sourceStderr, closeStderr)
-     , sph) <- streamingProcess cp
+          consumerStderr :: Consumer B.ByteString IO ()
+          consumerStderr = writeToConsole =$= sinkHandle stderrLog
 
-    pid <- withProcessHandle (streamingProcessHandleRaw sph) $ \case
-      OpenHandle pid -> return pid
-      ClosedHandle exitCode -> error $ "Process already exited with code " ++ show exitCode
+      (  ClosedStream
+       , (sourceStdout, closeStdout)
+       , (sourceStderr, closeStderr)
+       , sph) <- streamingProcess cp
 
-    let onStartedNode = do
-          readMVar saidStartedVar
-          putStrLn $ "node is started with pid " ++ show pid
-          threadDelay 10000000
-          putStrLn $ "sending SIGTSTP to pid " ++ show pid
-          signalProcess sigTSTP pid
-          threadDelay 10000000
-          putStrLn $ "sending SIGCONT to pid " ++ show pid
-          signalProcess sigCONT pid
-          threadDelay 10000000
-          putStrLn $ "sending SIGKILL to pid " ++ show pid
-          signalProcess sigKILL pid
+      pid <- withProcessHandle (streamingProcessHandleRaw sph) $ \case
+        OpenHandle pid -> return pid
+        ClosedHandle exitCode -> error $ "Process already exited with code " ++ show exitCode
 
-    withAsync onStartedNode $ \_ -> do
-      ((), ()) <-
-        runConcurrently (
-          (,)
-          <$> Concurrently (sourceStdout  $$ consumerStdout)
-          <*> Concurrently (sourceStderr  $$ consumerStderr))
-        `finally` (closeStdout >> closeStderr)
-        `onException` terminateStreamingProcess sph
-      ec <- waitForStreamingProcess sph
-      print $ "Exit code: " ++ show ec
+      let onStartedNode = do
+            readMVar saidStartedVar
+            putStrLn $ "node is started with pid " ++ show pid
+            threadDelay 10000000
+            putStrLn $ "sending SIGTSTP to pid " ++ show pid
+            signalProcess sigTSTP pid
+            threadDelay 10000000
+            putStrLn $ "sending SIGCONT to pid " ++ show pid
+            signalProcess sigCONT pid
+            threadDelay 10000000
+            putStrLn $ "sending SIGKILL to pid " ++ show pid
+            signalProcess sigKILL pid
 
-    return ()
+      withAsync onStartedNode $ \_ -> do
+        ((), ()) <-
+          runConcurrently (
+            (,)
+            <$> Concurrently (sourceStdout  $$ consumerStdout)
+            <*> Concurrently (sourceStderr  $$ consumerStderr))
+          `finally` (closeStdout >> closeStderr)
+          `onException` terminateStreamingProcess sph
+        ec <- waitForStreamingProcess sph
+        print $ "Exit code: " ++ show ec
+
+  mapM_ wait nodeManagers
