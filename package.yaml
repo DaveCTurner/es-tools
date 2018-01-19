@@ -7,6 +7,18 @@ copyright:           "2018 Elastic"
 
 dependencies:
 - base >= 4.7 && < 5
+- async
+- bytestring
+- conduit
+- conduit-extra
+- directory
+- filepath
+- process
+- streaming-commons
+- time
+- resourcet
+- text
+- unix
 
 executables:
   start-node:
