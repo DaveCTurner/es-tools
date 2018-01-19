@@ -104,7 +104,6 @@ makeConfig otherNodePorts nc = do
 
   runResourceT $ runConduit
      $  sourceConfig otherNodePorts nc
-    =$= writeToConsole
     =$= sinkFile   (configDirectory nc </> "elasticsearch.yml")
 
 writeToConsole :: MonadIO m => ConduitM B.ByteString B.ByteString m ()
@@ -131,8 +130,8 @@ main = do
             , ncName                 = (if isMaster then "master-" else "data-") ++ show nodeIndex
             , ncIsMasterEligibleNode = isMaster
             , ncIsDataNode           = not isMaster
-            , ncHttpPort             = 9200 + nodeIndex
-            , ncPublishPort          = 9300 + nodeIndex
+            , ncHttpPort             = 19200 + nodeIndex
+            , ncPublishPort          = 19300 + nodeIndex
             }
           | nodeIndex <- [1..6]
           , let isMaster = nodeIndex <= 3
@@ -178,11 +177,13 @@ main = do
             readMVar saidStartedVar
             putStrLn $ "node is started with pid " ++ show pid
             threadDelay 10000000
-            putStrLn $ "sending SIGTSTP to pid " ++ show pid
-            signalProcess sigTSTP pid
+            when (ncIsMasterEligibleNode nodeConfig) $ do
+              putStrLn $ "sending SIGTSTP to pid " ++ show pid
+              signalProcess sigTSTP pid
             threadDelay 10000000
-            putStrLn $ "sending SIGCONT to pid " ++ show pid
-            signalProcess sigCONT pid
+            when (ncIsMasterEligibleNode nodeConfig) $ do
+              putStrLn $ "sending SIGCONT to pid " ++ show pid
+              signalProcess sigCONT pid
             threadDelay 10000000
             putStrLn $ "sending SIGKILL to pid " ++ show pid
             signalProcess sigKILL pid
