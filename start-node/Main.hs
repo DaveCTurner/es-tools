@@ -78,8 +78,8 @@ sourceConfig otherNodePorts nc = mapM_ yieldString
   [ "cluster.name: " ++ crName (ncCurrentRun nc)
   , "node.name: " ++ ncName nc
   , "discovery.zen.minimum_master_nodes: 2"
-  , "node.master: " ++ if ncIsDataNode nc then "true" else "false"
-  , "node.data: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
+  , "node.data: " ++ if ncIsDataNode nc then "true" else "false"
+  , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
   , "path.data: " ++ (nodeWorkingDirectory nc </> "data")
   , "path.logs: " ++ (nodeWorkingDirectory nc </> "logs")
   , "network.host: 127.0.0.1"
