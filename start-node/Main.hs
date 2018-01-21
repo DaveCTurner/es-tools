@@ -144,8 +144,8 @@ main = do
     makeConfig (map ncPublishPort nodeConfigs) nodeConfig
 
     async $
-      withFile (stdoutPath nodeConfig) WriteMode $ \stdoutLog ->
-      withFile (stderrPath nodeConfig) WriteMode $ \stderrLog -> do
+      withFile (stdoutPath nodeConfig) AppendMode $ \stdoutLog ->
+      withFile (stderrPath nodeConfig) AppendMode $ \stderrLog -> do
 
       saidStartedVar <- newEmptyMVar
 
