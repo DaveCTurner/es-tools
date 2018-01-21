@@ -14,6 +14,7 @@ dependencies:
 - directory
 - filepath
 - process
+- stm
 - streaming-commons
 - time
 - resourcet
