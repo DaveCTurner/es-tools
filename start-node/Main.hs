@@ -6,6 +6,7 @@
 
 module Main where
 
+import Text.Printf
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
@@ -21,6 +22,7 @@ import Data.Conduit.Process
 import Data.Maybe
 import Data.Streaming.Process
 import Data.Time
+import Data.Time.ISO8601
 import System.Directory
 import System.Environment
 import System.Exit
@@ -41,19 +43,37 @@ mkEnv = Just . mapMaybe (\(k, mv) -> fmap (k,) mv)
 data CurrentRun = CurrentRun
   { crName :: String
   , crWorkingDirectory :: FilePath
+  , crWriteLog :: String -> IO ()
   }
 
-getCurrentRun :: IO CurrentRun
-getCurrentRun = do
+class CanLog a where
+  writeLog :: a -> String -> IO ()
+
+instance CanLog CurrentRun where
+  writeLog = crWriteLog
+
+withCurrentRun :: (CurrentRun -> IO a) -> IO a
+withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%s.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
   createDirectoryIfMissing True workingDirectory
-  putStrLn $ "Working directory: " ++ workingDirectory
-  return CurrentRun
-    { crName = runName
-    , crWorkingDirectory = workingDirectory
-    }
+  withFile (workingDirectory </> "run.log") WriteMode $ \hLog -> do
+
+    logLock <- newMVar ()
+
+    let writeLogCurrentRun msg = withMVar logLock $ \() -> do
+          now <- formatISO8601Micros <$> getCurrentTime
+          let fullMsg = "[" ++ now ++ "] " ++ msg
+          putStrLn fullMsg
+          hPutStrLn hLog fullMsg
+
+    writeLogCurrentRun $ printf "Starting run with working directory: " ++ workingDirectory
+    go CurrentRun
+      { crName             = runName
+      , crWorkingDirectory = workingDirectory
+      , crWriteLog         = writeLogCurrentRun
+      }
 
 data NodeConfig = NodeConfig
   { ncCurrentRun           :: CurrentRun
@@ -65,6 +85,9 @@ data NodeConfig = NodeConfig
   , ncJavaHome             :: Maybe String
   , ncUnicastHostPorts     :: [Int]
   }
+
+instance CanLog NodeConfig where
+  writeLog nc = writeLog (ncCurrentRun nc) . printf "[%-9s] %s" (ncName nc)
 
 stdoutPath :: NodeConfig -> FilePath
 stdoutPath nc = nodeWorkingDirectory nc </> "stdout.log"
@@ -120,6 +143,8 @@ sourceJvmOptions = mapM_ yieldString
 
 makeConfig :: NodeConfig -> IO ()
 makeConfig nc = do
+  writeLog nc "makeConfig"
+
   createDirectoryIfMissing True $ configDirectory nc
 
   runResourceT $ runConduit
@@ -149,25 +174,36 @@ checkStarted onStarted = awaitForever $ \bs -> do
   yield bs
 
 data ElasticsearchNode = ElasticsearchNode
-  { esnHandle    :: StreamingProcessHandle
+  { esnConfig    :: NodeConfig
+  , esnHandle    :: StreamingProcessHandle
   , esnIsStarted :: STM Bool
   , esnThread    :: Async ExitCode
   }
 
+instance CanLog ElasticsearchNode where
+  writeLog = writeLog . esnConfig
+
 runNode :: NodeConfig -> IO ElasticsearchNode
 runNode nodeConfig = do
+
+  writeLog nodeConfig "runNode"
+
   makeConfig nodeConfig
 
   (  ClosedStream
    , (sourceStdout, closeStdout)
    , (sourceStderr, closeStderr)
-   , sph) <- streamingProcess $ 
+   , sph) <- streamingProcess $
         (proc "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/bin/elasticsearch" [])
         { cwd = Just $ crWorkingDirectory $ ncCurrentRun nodeConfig
         , env = mkEnv $
             [("ES_PATH_CONF", Just $ configDirectory nodeConfig)
             ,("JAVA_HOME", ncJavaHome nodeConfig)]
         }
+
+  withProcessHandle (streamingProcessHandleRaw sph) $ \case
+    OpenHandle pid -> writeLog nodeConfig $ "started with PID " ++ show pid
+    _              -> writeLog nodeConfig $ "started but not OpenHandle"
 
   saidStartedVar <- newTVarIO False
 
@@ -177,25 +213,39 @@ runNode nodeConfig = do
 
     let concurrentConduit = Concurrently . runConduit
 
+        onStarted = do
+          writeLog nodeConfig "onStarted"
+          atomically $ writeTVar saidStartedVar True
+
+        terminateAndLog = do
+          writeLog nodeConfig "terminateAndLog"
+          terminateProcess $ streamingProcessHandleRaw sph
+
     ((), ()) <- runConcurrently ((,)
-        <$> concurrentConduit (sourceStdout =$= writeToConsole =$= checkStarted (atomically $ writeTVar saidStartedVar True)
+        <$> concurrentConduit (sourceStdout =$= writeToConsole =$= checkStarted onStarted
                                                                =$= sinkHandle stdoutLog)
         <*> concurrentConduit (sourceStderr =$= writeToConsole =$= sinkHandle stderrLog))
       `finally`     (closeStdout >> closeStderr)
-      `onException` terminateProcess (streamingProcessHandleRaw sph)
+      `onException` terminateAndLog
 
-    waitForStreamingProcess sph
+    ec <- waitForStreamingProcess sph
+    writeLog nodeConfig $ "exited: " ++ show ec
+    return ec
 
   return $ ElasticsearchNode
-    { esnHandle    = sph
+    { esnConfig    = nodeConfig
+    , esnHandle    = sph
     , esnIsStarted = readTVar saidStartedVar
     , esnThread    = nodeThread
     }
 
 signalNode :: ElasticsearchNode -> Signal -> IO ()
-signalNode ElasticsearchNode{..} signal = withProcessHandle ph $ \case
-  OpenHandle pid -> signalProcess signal pid
-  _ -> return ()
+signalNode n@ElasticsearchNode{..} signal = withProcessHandle ph $ \case
+  OpenHandle pid -> do
+    writeLog n $ "sending signal " ++ show signal ++ " to PID " ++ show pid
+    signalProcess signal pid
+  _ ->
+    writeLog n $ "not sending signal " ++ show signal ++ " as handle is not OpenHandle"
   where ph = streamingProcessHandleRaw esnHandle
 
 awaitStarted :: ElasticsearchNode -> STM Bool
@@ -211,9 +261,8 @@ awaitExit :: ElasticsearchNode -> STM ExitCode
 awaitExit ElasticsearchNode{..} = waitSTM esnThread
 
 main :: IO ()
-main = do
+main = withCurrentRun $ \currentRun -> do
 
-  currentRun <- getCurrentRun
   javaHome <- lookupEnv "JAVA_HOME"
 
   let nodeConfigs
@@ -234,18 +283,33 @@ main = do
   nodes <- mapM runNode nodeConfigs
   let faultyNodes = take 2 nodes
 
-  startedFlags <- forM nodes $ atomically . awaitStarted
-  unless (and startedFlags) $ error $ "not all nodes started successfully: " ++ show startedFlags
+  startedFlags <- forM nodes $ \n -> do
+    result <- atomically $ awaitStarted n
+    writeLog n $ if result then "started successfully" else "did not start successfully"
+    return result
 
-  threadDelay 10000000
-  forM_ faultyNodes $ \n -> signalNode n sigTSTP
-  threadDelay 100000000
-  forM_ faultyNodes $ \n -> signalNode n sigCONT
-  threadDelay 10000000
-  forM_ faultyNodes $ \n -> do
-    signalNode n sigKILL
-    atomically $ awaitExit n
+  if not (and startedFlags)
+    then writeLog currentRun "not all nodes started successfully"
+    else do
 
-  forM_ nodes $ \n -> do
-    signalNode n sigTERM
-    atomically $ awaitExit n
+      threadDelay 10000000
+      writeLog currentRun "pausing some nodes"
+      forM_ faultyNodes $ \n -> signalNode n sigTSTP
+
+      threadDelay 100000000
+      writeLog currentRun "resuming paused nodes"
+      forM_ faultyNodes $ \n -> signalNode n sigCONT
+
+      writeLog currentRun "killing some nodes"
+      threadDelay 10000000
+      forM_ faultyNodes $ \n -> do
+        signalNode n sigKILL
+        atomically $ awaitExit n
+
+      writeLog currentRun "terminating all nodes"
+      forM_ nodes $ \n -> do
+        signalNode n sigTERM
+        atomically $ awaitExit n
+        writeLog n "terminated"
+
+  writeLog currentRun "finished"

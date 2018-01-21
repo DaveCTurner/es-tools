@@ -13,6 +13,7 @@ dependencies:
 - conduit-extra
 - directory
 - filepath
+- iso8601-time
 - process
 - stm
 - streaming-commons
