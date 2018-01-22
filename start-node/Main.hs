@@ -6,31 +6,37 @@
 
 module Main where
 
-import Text.Printf
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception
-import System.Posix.Signals
+import Control.Lens hiding ((.=))
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Resource
+import Data.Aeson
+import Data.Aeson.Lens
 import Data.Conduit
-import Data.Conduit.Binary hiding (mapM_, take)
+import Data.Conduit.Binary hiding (mapM_, take, head)
 import Data.Conduit.Process
 import Data.Maybe
 import Data.Streaming.Process
 import Data.Time
 import Data.Time.ISO8601
+import Network.HTTP.Client
+import Network.HTTP.Types.Header
 import System.Directory
 import System.Environment
 import System.Exit
 import System.FilePath
 import System.IO
+import System.Posix.Signals
 import System.Process
 import System.Process.Internals
+import Text.Printf
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
@@ -41,9 +47,10 @@ mkEnv :: [(String, Maybe String)] -> Maybe [(String, String)]
 mkEnv = Just . mapMaybe (\(k, mv) -> fmap (k,) mv)
 
 data CurrentRun = CurrentRun
-  { crName :: String
+  { crName             :: String
   , crWorkingDirectory :: FilePath
-  , crWriteLog :: String -> IO ()
+  , crWriteLog         :: String -> IO ()
+  , crManager          :: Manager
   }
 
 class CanLog a where
@@ -68,11 +75,14 @@ withCurrentRun go = do
           putStrLn fullMsg
           hPutStrLn hLog fullMsg
 
+    manager <- newManager defaultManagerSettings
+
     writeLogCurrentRun $ printf "Starting run with working directory: " ++ workingDirectory
     go CurrentRun
       { crName             = runName
       , crWorkingDirectory = workingDirectory
       , crWriteLog         = writeLogCurrentRun
+      , crManager          = manager
       }
 
 data NodeConfig = NodeConfig
@@ -260,6 +270,24 @@ awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
 awaitExit :: ElasticsearchNode -> STM ExitCode
 awaitExit ElasticsearchNode{..} = waitSTM esnThread
 
+callApi :: ToJSON req => ElasticsearchNode -> B.ByteString -> String -> req -> IO (Maybe Value)
+callApi node verb path reqBody = do
+  rawReq <- parseRequest $ printf "http://127.0.0.1:%d%s" (ncHttpPort $ esnConfig node) path
+  let req = rawReq
+        { method         = verb
+        , requestHeaders = requestHeaders rawReq ++ [(hContentType, "application/json")]
+        , requestBody    = RequestBodyLBS $ encode reqBody
+        }
+      manager = crManager $ ncCurrentRun $ esnConfig node
+
+  withResponse req manager $ \response -> decode . BL.fromChunks <$> brConsume (responseBody response)
+
+waitForGreen :: ElasticsearchNode -> IO ()
+waitForGreen node = do
+  healthResult <- callApi node "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
+  writeLog node $ "waitForGreen: " ++ show healthResult
+  when (healthResult ^.. _Just . key "status" . _String /= ["green"]) $ waitForGreen node
+
 main :: IO ()
 main = withCurrentRun $ \currentRun -> do
 
@@ -280,36 +308,86 @@ main = withCurrentRun $ \currentRun -> do
           , let isMaster = nodeIndex <= 3
           ]
 
-  nodes <- mapM runNode nodeConfigs
-  let faultyNodes = take 2 nodes
+      killRemainingNodes nodes = do
+        writeLog currentRun "killing any remaining nodes"
+        forM_ nodes $ \n -> do
+          isRunning <- atomically $ (awaitExit n >> return False) `orElse` return True
+          when isRunning $ do
+            signalNode n sigKILL
+            void $ atomically $ awaitExit n
 
-  startedFlags <- forM nodes $ \n -> do
-    result <- atomically $ awaitStarted n
-    writeLog n $ if result then "started successfully" else "did not start successfully"
-    return result
+      bailOut msg = do
+        writeLog currentRun msg
+        error msg
 
-  if not (and startedFlags)
-    then writeLog currentRun "not all nodes started successfully"
-    else do
+  bracket (mapM runNode nodeConfigs) killRemainingNodes $ \nodes -> do
 
-      threadDelay 10000000
-      writeLog currentRun "pausing some nodes"
-      forM_ faultyNodes $ \n -> signalNode n sigTSTP
+    let faultyNodes = take 2 nodes
 
-      threadDelay 100000000
-      writeLog currentRun "resuming paused nodes"
-      forM_ faultyNodes $ \n -> signalNode n sigCONT
+    startedFlags <- forM nodes $ \n -> do
+      result <- atomically $ awaitStarted n
+      writeLog n $ if result then "started successfully" else "did not start successfully"
+      return result
 
-      writeLog currentRun "killing some nodes"
-      threadDelay 10000000
-      forM_ faultyNodes $ \n -> do
-        signalNode n sigKILL
-        atomically $ awaitExit n
+    unless (and startedFlags) $ bailOut "not all nodes started successfully"
 
-      writeLog currentRun "terminating all nodes"
-      forM_ nodes $ \n -> do
-        signalNode n sigTERM
-        atomically $ awaitExit n
-        writeLog n "terminated"
+    createIndexResult <- callApi (head nodes) "PUT" "/synctest" $ object
+      [ "settings" .= object
+        [ "index" .= object
+          [ "number_of_shards"   .= Number 1
+          , "number_of_replicas" .= Number 1
+          ]
+        ]
+      , "mappings" .= object
+        [ "testdoc" .= object
+          [ "properties" .= object
+            [ "serial"  .= object [ "type" .= String "integer" ]
+            , "updated" .= object [ "type" .= String "long" ]
+            ]
+          ]
+        ]
+      ]
 
-  writeLog currentRun "finished"
+    unless (createIndexResult ^.. _Just . key "status" . _Number == [])
+      $ bailOut $ "create index failed: " ++ show createIndexResult
+
+    waitForGreen (head nodes)
+
+    state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
+    let masterNodes =
+          [ nodeName
+          | nodeId   <- state ^.. _Just . key "master_node" . _String
+          , nodeName <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String
+          ]
+    let shardCopies =
+          [ (nodeName, isPrimary)
+          | routingTableEntry <- state ^.. _Just . key "routing_table" . key "indices" . key "synctest" . key "shards" . key "0" . values
+          , nodeId    <- routingTableEntry ^.. key "node" . _String
+          , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
+          , nodeName  <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String
+          ]
+
+    writeLog currentRun $ "masters: " ++ show masterNodes
+    writeLog currentRun $ "shard copies: " ++ show shardCopies
+
+    threadDelay 10000000
+    writeLog currentRun "pausing some nodes"
+    forM_ faultyNodes $ \n -> signalNode n sigTSTP
+
+    threadDelay 100000000
+    writeLog currentRun "resuming paused nodes"
+    forM_ faultyNodes $ \n -> signalNode n sigCONT
+
+    writeLog currentRun "killing some nodes"
+    threadDelay 10000000
+    forM_ faultyNodes $ \n -> do
+      signalNode n sigKILL
+      atomically $ awaitExit n
+
+    writeLog currentRun "terminating all nodes"
+    forM_ nodes $ \n -> do
+      signalNode n sigTERM
+      atomically $ awaitExit n
+      writeLog n "terminated"
+
+    writeLog currentRun "finished"

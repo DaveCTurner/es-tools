@@ -7,19 +7,24 @@ copyright:           "2018 Elastic"
 
 dependencies:
 - base >= 4.7 && < 5
+- aeson
 - async
 - bytestring
 - conduit
 - conduit-extra
 - directory
 - filepath
+- http-client
+- http-types
 - iso8601-time
+- lens
+- lens-aeson
 - process
+- resourcet
 - stm
 - streaming-commons
-- time
-- resourcet
 - text
+- time
 - unix
 
 executables:
