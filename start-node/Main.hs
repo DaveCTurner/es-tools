@@ -93,7 +93,8 @@ data NodeConfig = NodeConfig
   , ncHttpPort             :: Int
   , ncPublishPort          :: Int
   , ncJavaHome             :: Maybe String
-  , ncUnicastHostPorts     :: [Int]
+  , ncBindHost             :: String
+  , ncUnicastHosts         :: [String]
   }
 
 instance CanLog NodeConfig where
@@ -120,10 +121,10 @@ sourceConfig nc = mapM_ yieldString
   , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
   , "path.data: " ++ (nodeWorkingDirectory nc </> "data")
   , "path.logs: " ++ (nodeWorkingDirectory nc </> "logs")
-  , "network.host: 127.0.0.1"
+  , "network.host: " ++ ncBindHost nc
   , "http.port: " ++ show (ncHttpPort nc)
   , "transport.tcp.port: " ++ show (ncPublishPort nc)
-  , "discovery.zen.ping.unicast.hosts: " ++ show [ "127.0.0.1:" ++ show p | p <- ncUnicastHostPorts nc]
+  , "discovery.zen.ping.unicast.hosts: " ++ show (ncUnicastHosts nc)
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -272,7 +273,7 @@ awaitExit ElasticsearchNode{..} = waitSTM esnThread
 
 callApi :: ToJSON req => ElasticsearchNode -> B.ByteString -> String -> req -> IO (Maybe Value)
 callApi node verb path reqBody = do
-  rawReq <- parseRequest $ printf "http://127.0.0.1:%d%s" (ncHttpPort $ esnConfig node) path
+  rawReq <- parseRequest $ printf "http://%s:%d%s" (ncBindHost $ esnConfig node) (ncHttpPort $ esnConfig node) path
   let req = rawReq
         { method         = verb
         , requestHeaders = requestHeaders rawReq ++ [(hContentType, "application/json")]
@@ -302,7 +303,10 @@ main = withCurrentRun $ \currentRun -> do
             , ncHttpPort             = 19200 + nodeIndex
             , ncPublishPort          = 19300 + nodeIndex
             , ncJavaHome             = javaHome
-            , ncUnicastHostPorts     = [ncPublishPort nc | nc <- nodeConfigs, ncIsMasterEligibleNode nc]
+            , ncBindHost             = "127.0.0.1"
+            , ncUnicastHosts         = [ ncBindHost nc ++ ":" ++ show (ncPublishPort nc)
+                                       | nc <- nodeConfigs
+                                       , ncIsMasterEligibleNode nc]
             }
           | nodeIndex <- [1..6]
           , let isMaster = nodeIndex <= 3
