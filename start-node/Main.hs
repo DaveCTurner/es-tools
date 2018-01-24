@@ -88,7 +88,8 @@ withCurrentRun go = do
   let workingDirectory = cwd </> "output" </> runName
       networkName = "elasticnet"
 
-  createDirectoryIfMissing True workingDirectory
+  createElasticDirectory workingDirectory
+
   withFile (workingDirectory </> "run.log") WriteMode $ \hLog ->
     bracket (dockerNetworkCreate networkName) dockerNetworkRemove $ \dockerNetwork -> do
 
@@ -160,43 +161,18 @@ sourceConfig nc = mapM_ yieldString
 yieldString :: Monad m => String -> Producer m B.ByteString
 yieldString = yield . T.encodeUtf8 . T.pack . (++ "\n")
 
-sourceJvmOptions :: Monad m => Producer m B.ByteString
-sourceJvmOptions = mapM_ yieldString
-  [ "-Xms1g"
-  , "-Xmx1g"
-  , "-XX:+UseConcMarkSweepGC"
-  , "-XX:CMSInitiatingOccupancyFraction=75"
-  , "-XX:+UseCMSInitiatingOccupancyOnly"
-  , "-XX:+AlwaysPreTouch"
-  , "-server"
-  , "-Xss1m"
-  , "-Djava.awt.headless=true"
-  , "-Dfile.encoding=UTF-8"
-  , "-Djna.nosys=true"
-  , "-XX:-OmitStackTraceInFastThrow"
-  , "-Dio.netty.noUnsafe=true"
-  , "-Dio.netty.noKeySetOptimization=true"
-  , "-Dio.netty.recycler.maxCapacityPerThread=0"
-  , "-Dlog4j.shutdownHookEnabled=false"
-  , "-Dlog4j2.disable.jmx=true"
-  , "-XX:+HeapDumpOnOutOfMemoryError"
-  ]
+createElasticDirectory :: FilePath -> IO ()
+createElasticDirectory path = do
+  createDirectoryIfMissing True path
+  callProcess "sudo" ["chown", "elastic:elastic", path]
 
 makeConfig :: NodeConfig -> IO ()
 makeConfig nc = do
   writeLog nc "makeConfig"
 
-  createDirectoryIfMissing True $ configDirectory nc
-  createDirectoryIfMissing True $ nodeWorkingDirectory nc </> "data"
-  createDirectoryIfMissing True $ nodeWorkingDirectory nc </> "logs"
-
-  runResourceT $ runConduit
-     $  sourceFile "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/config/log4j2.properties"
-    =$= sinkFile   (configDirectory nc </> "log4j2.properties")
-
-  runResourceT $ runConduit
-     $  sourceJvmOptions
-    =$= sinkFile   (configDirectory nc </> "jvm.options")
+  createElasticDirectory $ configDirectory nc
+  createElasticDirectory $ nodeWorkingDirectory nc </> "data"
+  createElasticDirectory $ nodeWorkingDirectory nc </> "logs"
 
   runResourceT $ runConduit
      $  sourceConfig nc
