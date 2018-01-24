@@ -406,19 +406,19 @@ main = withCurrentRun $ \currentRun -> do
 
     threadDelay 10000000
     writeLog currentRun "pausing some nodes"
-    forM_ faultyNodes $ \n -> signalNode n "TSTP"
+    forM_ faultyNodes $ \n -> signalNode n "STOP"
 
     threadDelay 100000000
     writeLog currentRun "resuming paused nodes"
     forM_ faultyNodes $ \n -> signalNode n "CONT"
+
+    forever $ threadDelay 10000000
 
     writeLog currentRun "killing some nodes"
     threadDelay 10000000
     forM_ faultyNodes $ \n -> do
       signalNode n "KILL"
       atomically $ awaitExit n
-
-    forever $ threadDelay 10000000
 
     writeLog currentRun "terminating all nodes"
     forM_ nodes $ \n -> do
