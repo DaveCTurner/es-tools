@@ -14,6 +14,7 @@ dependencies:
 - conduit-extra
 - directory
 - filepath
+- hashable
 - http-client
 - http-types
 - iso8601-time

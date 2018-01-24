@@ -20,6 +20,7 @@ import Data.Aeson.Lens
 import Data.Conduit
 import Data.Conduit.Binary hiding (mapM_, take, head)
 import Data.Conduit.Process
+import Data.Hashable
 import Data.Maybe
 import Data.Streaming.Process
 import Data.Time
@@ -51,6 +52,7 @@ data CurrentRun = CurrentRun
   , crWorkingDirectory :: FilePath
   , crWriteLog         :: String -> IO ()
   , crManager          :: Manager
+  , crDockerNetwork    :: DockerNetwork
   }
 
 class CanLog a where
@@ -59,13 +61,38 @@ class CanLog a where
 instance CanLog CurrentRun where
   writeLog = crWriteLog
 
+newtype DockerNetwork = DockerNetwork { _unDockerNetwork :: String }
+  deriving (Show, Eq)
+
+dockerNetworkCreate :: String -> IO DockerNetwork
+dockerNetworkCreate networkName = DockerNetwork <$> do
+
+  let args = ["network", "create", "--driver=bridge", "--subnet=10.10.10.0/24", "--ip-range=10.10.10.0/24"
+             ,"--opt", "com.docker.network.bridge.name=" ++ networkName, networkName]
+
+  putStrLn $ unwords args
+
+  (ec, stdout, stderr) <- readProcessWithExitCode "docker" args ""
+
+  if null stderr && ec == ExitSuccess
+    then return $ filter (> ' ') stdout
+    else error ("docker network create failed: " ++ stderr)
+
+dockerNetworkRemove :: DockerNetwork-> IO ()
+dockerNetworkRemove dockerNetwork = callProcess "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
+
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%s.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
+      networkName = "elasticnet"
+
   createDirectoryIfMissing True workingDirectory
-  withFile (workingDirectory </> "run.log") WriteMode $ \hLog -> do
+  withFile (workingDirectory </> "run.log") WriteMode $ \hLog ->
+    bracket (dockerNetworkCreate networkName) dockerNetworkRemove $ \dockerNetwork -> do
+
+    putStrLn $ "Using docker network " ++ show dockerNetwork
 
     logLock <- newMVar ()
 
@@ -83,6 +110,7 @@ withCurrentRun go = do
       , crWorkingDirectory = workingDirectory
       , crWriteLog         = writeLogCurrentRun
       , crManager          = manager
+      , crDockerNetwork    = dockerNetwork
       }
 
 data NodeConfig = NodeConfig
@@ -119,26 +147,14 @@ sourceConfig nc = mapM_ yieldString
   , "discovery.zen.minimum_master_nodes: 2"
   , "node.data: " ++ if ncIsDataNode nc then "true" else "false"
   , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
-  , "path.data: " ++ (nodeWorkingDirectory nc </> "data")
-  , "path.logs: " ++ (nodeWorkingDirectory nc </> "logs")
   , "network.host: " ++ ncBindHost nc
   , "http.port: " ++ show (ncHttpPort nc)
   , "transport.tcp.port: " ++ show (ncPublishPort nc)
   , "discovery.zen.ping.unicast.hosts: " ++ show (ncUnicastHosts nc)
-{-
-
-Docker used this:
-
-cluster.name: "docker-cluster"
-network.host: _eth0_
-discovery.zen.minimum_master_nodes: 2
-discovery.zen.ping.unicast.hosts: ["10.10.10.101:9300", "10.10.10.102:9300"]
-xpack.security.enabled: false
-xpack.monitoring.enabled: false
-xpack.watcher.enabled: false
-xpack.ml.enabled: false
-
--}
+  , "xpack.security.enabled: false"
+  , "xpack.monitoring.enabled: false"
+  , "xpack.watcher.enabled: false"
+  , "xpack.ml.enabled: false"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -171,6 +187,8 @@ makeConfig nc = do
   writeLog nc "makeConfig"
 
   createDirectoryIfMissing True $ configDirectory nc
+  createDirectoryIfMissing True $ nodeWorkingDirectory nc </> "data"
+  createDirectoryIfMissing True $ nodeWorkingDirectory nc </> "logs"
 
   runResourceT $ runConduit
      $  sourceFile "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/config/log4j2.properties"
@@ -215,15 +233,25 @@ runNode nodeConfig = do
 
   makeConfig nodeConfig
 
+  let args = ["run", "--rm"
+             , "--name", ncName nodeConfig
+             , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "data" ++ ",target=/usr/share/elasticsearch/data"
+             , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "logs" ++ ",target=/usr/share/elasticsearch/logs"
+             , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
+             , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
+             , "--ip", ncBindHost nodeConfig
+             , "docker.elastic.co/elasticsearch/elasticsearch:5.4.3"
+             ]
+
+  writeLog nodeConfig $ "executing: docker " ++ unwords args
+
   (  ClosedStream
    , (sourceStdout, closeStdout)
    , (sourceStderr, closeStderr)
    , sph) <- streamingProcess $
-        (proc "/Users/davidturner/stack-6.1.1/elasticsearch-6.1.1/bin/elasticsearch" [])
+        (proc "docker" args)
         { cwd = Just $ crWorkingDirectory $ ncCurrentRun nodeConfig
-        , env = mkEnv $
-            [("ES_PATH_CONF", Just $ configDirectory nodeConfig)
-            ,("JAVA_HOME", ncJavaHome nodeConfig)]
+        , env = Just []
         }
 {-
 
@@ -281,15 +309,9 @@ docker run
     , esnThread    = nodeThread
     }
 
-signalNode :: ElasticsearchNode -> Signal -> IO ()
-signalNode n@ElasticsearchNode{..} signal = withProcessHandle ph $ \case
-  OpenHandle pid -> do
-    writeLog n $ "sending signal " ++ show signal ++ " to PID " ++ show pid
-    signalProcess signal pid
-  _ ->
-    writeLog n $ "not sending signal " ++ show signal ++ " as handle is not OpenHandle"
-  where ph = streamingProcessHandleRaw esnHandle
-{- In docker, can use `docker kill`? -}
+signalNode :: ElasticsearchNode -> String -> IO ()
+signalNode n@ElasticsearchNode{..} signal = callProcess "docker"
+  ["kill", "--signal", signal, ncName esnConfig]
 
 awaitStarted :: ElasticsearchNode -> STM Bool
 awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
@@ -332,10 +354,10 @@ main = withCurrentRun $ \currentRun -> do
             , ncName                 = (if isMaster then "master-" else "data-") ++ show nodeIndex
             , ncIsMasterEligibleNode = isMaster
             , ncIsDataNode           = not isMaster
-            , ncHttpPort             = 19200 + nodeIndex
-            , ncPublishPort          = 19300 + nodeIndex
+            , ncHttpPort             = 9200
+            , ncPublishPort          = 9300
             , ncJavaHome             = javaHome
-            , ncBindHost             = "127.0.0.1"
+            , ncBindHost             = "10.10.10." ++ show (100 + nodeIndex)
             , ncUnicastHosts         = [ ncBindHost nc ++ ":" ++ show (ncPublishPort nc)
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
@@ -349,7 +371,7 @@ main = withCurrentRun $ \currentRun -> do
         forM_ nodes $ \n -> do
           isRunning <- atomically $ (awaitExit n >> return False) `orElse` return True
           when isRunning $ do
-            signalNode n sigKILL
+            signalNode n "KILL"
             void $ atomically $ awaitExit n
 
       bailOut msg = do
@@ -408,21 +430,23 @@ main = withCurrentRun $ \currentRun -> do
 
     threadDelay 10000000
     writeLog currentRun "pausing some nodes"
-    forM_ faultyNodes $ \n -> signalNode n sigTSTP
+    forM_ faultyNodes $ \n -> signalNode n "TSTP"
 
     threadDelay 100000000
     writeLog currentRun "resuming paused nodes"
-    forM_ faultyNodes $ \n -> signalNode n sigCONT
+    forM_ faultyNodes $ \n -> signalNode n "CONT"
 
     writeLog currentRun "killing some nodes"
     threadDelay 10000000
     forM_ faultyNodes $ \n -> do
-      signalNode n sigKILL
+      signalNode n "KILL"
       atomically $ awaitExit n
+
+    forever $ threadDelay 10000000
 
     writeLog currentRun "terminating all nodes"
     forM_ nodes $ \n -> do
-      signalNode n sigTERM
+      signalNode n "TERM"
       atomically $ awaitExit n
       writeLog n "terminated"
 
