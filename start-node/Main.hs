@@ -289,6 +289,7 @@ signalNode n@ElasticsearchNode{..} signal = withProcessHandle ph $ \case
   _ ->
     writeLog n $ "not sending signal " ++ show signal ++ " as handle is not OpenHandle"
   where ph = streamingProcessHandleRaw esnHandle
+{- In docker, can use `docker kill`? -}
 
 awaitStarted :: ElasticsearchNode -> STM Bool
 awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
