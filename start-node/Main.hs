@@ -108,7 +108,7 @@ withLogFile path go = withFile path AppendMode $ \hLog -> do
 
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
-  runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%s.%q" <$> getCurrentTime
+  runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
       networkName = "elasticnet"
