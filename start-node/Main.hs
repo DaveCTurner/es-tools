@@ -365,7 +365,7 @@ restoreLink = bothWays restoreDirectedLink
 
 restoreDirectedLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
 restoreDirectedLink n1 n2 = do
-  callProcess "sudo" [ "iptables", "-I", "DOCKER-USER"
+  callProcess "sudo" [ "iptables", "-D", "DOCKER-USER"
                      , "--source",      ncBindHost (esnConfig n1)
                      , "--destination", ncBindHost (esnConfig n2)
                      , "--protocol", "tcp"
