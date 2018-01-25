@@ -438,6 +438,7 @@ main = withCurrentRun $ \currentRun -> do
           [ "index" .= object
             [ "number_of_shards"   .= Number 1
             , "number_of_replicas" .= Number 1
+            , "unassigned.node_left.delayed_timeout" .= String "5s"
             ]
           ]
         , "mappings" .= object
@@ -501,7 +502,24 @@ main = withCurrentRun $ \currentRun -> do
     do 
       (_, _, replica) <- getNodeIdentities
       forM_ nodes $ breakLink replica
-      threadDelay 100000000
-      forM_ nodes $ restoreLink replica
+      threadDelay 1000000
+
+      void $ async $ do
+        threadDelay 100000000
+        forM_ nodes $ restoreLink replica
+
+    bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
+      shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" $ object []
+      let shardDocCounts =
+            [ (nodeId, docCount)
+            | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
+            , nodeId   <- shardCopyStats ^.. key "routing" . key "node"  . _String
+            , docCount <- shardCopyStats ^.. key "docs"    . key "count" . _Number
+            ]
+      liftIO $ writeLog currentRun $ "doc counts per node: " ++ show shardDocCounts
+      case shardDocCounts of
+        [(nodeId1, docCount1), (nodeId2, docCount2)]
+          | docCount1 == docCount2 -> liftIO $ writeLog currentRun "shards have matching doc counts"
+        _ -> throwError $ "did not find matching doc counts: " ++ show shardDocCounts
 
     writeLog currentRun "finished"
