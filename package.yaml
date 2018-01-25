@@ -27,6 +27,7 @@ dependencies:
 - text
 - time
 - unix
+- unordered-containers
 
 executables:
   start-node:

@@ -35,11 +35,13 @@ import System.IO
 import System.Posix.Signals
 import System.Process
 import System.Process.Internals
+import System.Timeout
 import Text.Printf
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Data.HashMap.Strict as HM
 
 terminateStreamingProcess :: StreamingProcessHandle -> IO ()
 terminateStreamingProcess = terminateProcess . streamingProcessHandleRaw
@@ -116,7 +118,7 @@ withCurrentRun go = do
 
     writeLogCurrentRun $ "Starting run with working directory: " ++ workingDirectory
 
-    bracket (dockerNetworkCreate writeLogCurrentRun networkName) 
+    bracket (dockerNetworkCreate writeLogCurrentRun networkName)
             (dockerNetworkRemove writeLogCurrentRun) $ \dockerNetwork -> do
 
       writeLogCurrentRun $ "Using docker network " ++ show dockerNetwork
@@ -143,6 +145,10 @@ data NodeConfig = NodeConfig
 
 instance CanLog NodeConfig where
   writeLog nc = writeLog (ncCurrentRun nc) . printf "[%-9s] %s" (ncName nc)
+
+class HasNodeName a where nodeName :: a -> String
+
+instance HasNodeName NodeConfig where nodeName = ncName
 
 stdoutPath :: NodeConfig -> FilePath
 stdoutPath nc = nodeWorkingDirectory nc </> "stdout.log"
@@ -216,8 +222,8 @@ data ElasticsearchNode = ElasticsearchNode
   , esnThread    :: Async ExitCode
   }
 
-instance CanLog ElasticsearchNode where
-  writeLog = writeLog . esnConfig
+instance CanLog      ElasticsearchNode where writeLog = writeLog . esnConfig
+instance HasNodeName ElasticsearchNode where nodeName = nodeName . esnConfig
 
 runNode :: NodeConfig -> IO ElasticsearchNode
 runNode nodeConfig = do
@@ -304,7 +310,7 @@ docker run
 
 signalNode :: ElasticsearchNode -> String -> IO ()
 signalNode n@ElasticsearchNode{..} signal =
-  callProcessNoThrow (writeLog n) "docker" ["kill", "--signal", signal, ncName esnConfig]
+  callProcessNoThrow (writeLog n) "docker" ["kill", "--signal", signal, nodeName n]
 
 awaitStarted :: ElasticsearchNode -> STM Bool
 awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
@@ -329,12 +335,6 @@ callApi node verb path reqBody = do
       manager = crManager $ ncCurrentRun $ esnConfig node
 
   withResponse req manager $ \response -> decode . BL.fromChunks <$> brConsume (responseBody response)
-
-waitForGreen :: ElasticsearchNode -> IO ()
-waitForGreen node = do
-  healthResult <- callApi node "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
-  writeLog node $ "waitForGreen: " ++ show healthResult
-  when (healthResult ^.. _Just . key "status" . _String /= ["green"]) $ waitForGreen node
 
 main :: IO ()
 main = withCurrentRun $ \currentRun -> do
@@ -373,7 +373,7 @@ main = withCurrentRun $ \currentRun -> do
 
   bracket (mapM runNode nodeConfigs) killRemainingNodes $ \nodes -> do
 
-    let faultyNodes = take 2 nodes
+    let nodesByName = HM.fromList [(nodeName n, n) | n <- nodes]
 
     startedFlags <- forM nodes $ \n -> do
       result <- atomically $ awaitStarted n
@@ -402,45 +402,57 @@ main = withCurrentRun $ \currentRun -> do
     unless (createIndexResult ^.. _Just . key "status" . _Number == [])
       $ bailOut $ "create index failed: " ++ show createIndexResult
 
-    waitForGreen (head nodes)
+    let getNodeIdentities = go $ cycle nodes
+          where
+            go [] = bailOut "getNodeIdentities: ran out of nodes"
+            go (n:ns) = do
+              let goAgain = do
+                    threadDelay 1000000
+                    go ns
 
-    state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
-    let masterNodes =
-          [ nodeName
-          | nodeId   <- state ^.. _Just . key "master_node" . _String
-          , nodeName <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String
-          ]
-    let shardCopies =
-          [ (nodeName, isPrimary)
-          | routingTableEntry <- state ^.. _Just . key "routing_table" . key "indices" . key "synctest" . key "shards" . key "0" . values
-          , nodeId    <- routingTableEntry ^.. key "node" . _String
-          , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
-          , nodeName  <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String
-          ]
+              healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
+              if healthResult ^.. _Just . key "status" . _String /= ["green"]
+                then goAgain
+                else do
 
-    writeLog currentRun $ "masters: " ++ show masterNodes
-    writeLog currentRun $ "shard copies: " ++ show shardCopies
+                  state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
 
-    threadDelay 10000000
-    writeLog currentRun "pausing some nodes"
-    forM_ faultyNodes $ \n -> signalNode n "STOP"
+                  let nodesFromIds nodeIds =
+                        [ node
+                        | nodeId <- nodeIds
+                        , nodeName <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String . to T.unpack
+                        , Just node <- [HM.lookup nodeName nodesByName]
+                        ]
 
-    threadDelay 100000000
-    writeLog currentRun "resuming paused nodes"
-    forM_ faultyNodes $ \n -> signalNode n "CONT"
+                      getUniqueNode :: String -> [ElasticsearchNode] -> IO ElasticsearchNode
+                      getUniqueNode nodeType = \case
+                        [x] -> return x
+                        notUnique -> bailOut $ printf "unique %s not found: got %s" nodeType (show $ map nodeName notUnique)
 
-    forever $ threadDelay 10000000
+                  masterNode <- getUniqueNode "master" $ nodesFromIds $ state ^.. _Just . key "master_node" . _String
 
-    writeLog currentRun "killing some nodes"
-    threadDelay 10000000
-    forM_ faultyNodes $ \n -> do
-      signalNode n "KILL"
-      atomically $ awaitExit n
+                  let shardCopyNodeIds =
+                        [ (nodeId, isPrimary)
+                        | routingTableEntry <- state ^.. _Just . key "routing_table" . key "indices" . key "synctest" . key "shards" . key "0" . values
+                        , nodeId    <- routingTableEntry ^.. key "node" . _String
+                        , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
+                        ]
 
-    writeLog currentRun "terminating all nodes"
-    forM_ nodes $ \n -> do
-      signalNode n "TERM"
-      atomically $ awaitExit n
-      writeLog n "terminated"
+                  primaryNode <- getUniqueNode "primary" $ nodesFromIds [n | (n, True)  <- shardCopyNodeIds]
+                  replicaNode <- getUniqueNode "replica" $ nodesFromIds [n | (n, False) <- shardCopyNodeIds]
+
+                  return (masterNode, primaryNode, replicaNode)
+
+    do
+      (master, primary, replica) <- getNodeIdentities
+
+      threadDelay 10000000
+
+      writeLog currentRun $ "pausing " ++ nodeName master
+      signalNode master "STOP"
+      threadDelay 100000000
+
+      writeLog currentRun $ "resuming " ++ nodeName master
+      signalNode master "CONT"
 
     writeLog currentRun "finished"
