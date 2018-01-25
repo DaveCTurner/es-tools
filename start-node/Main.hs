@@ -98,6 +98,11 @@ dockerNetworkRemove writeLog dockerNetwork = do
   threadDelay 1000000
   callProcessNoThrow writeLog "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
 
+withLogFile :: FilePath -> (Handle -> IO a) -> IO a
+withLogFile path go = withFile path AppendMode $ \hLog -> do
+  hSetBuffering hLog NoBuffering
+  go hLog
+
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%s.%q" <$> getCurrentTime
@@ -107,7 +112,7 @@ withCurrentRun go = do
 
   createElasticDirectory putStrLn workingDirectory
 
-  withFile (workingDirectory </> "run.log") WriteMode $ \hLog -> do
+  withLogFile (workingDirectory </> "run.log") $ \hLog -> do
     logLock <- newMVar ()
 
     let writeLogCurrentRun msg = withMVar logLock $ \() -> do
@@ -115,6 +120,7 @@ withCurrentRun go = do
           let fullMsg = "[" ++ now ++ "] " ++ msg
           putStrLn fullMsg
           hPutStrLn hLog fullMsg
+          hFlush hLog
 
     manager <- newManager defaultManagerSettings
 
@@ -169,6 +175,7 @@ sourceConfig nc = mapM_ yieldString
   [ "cluster.name: " ++ crName (ncCurrentRun nc)
   , "node.name: " ++ ncName nc
   , "discovery.zen.minimum_master_nodes: 2"
+  , "discovery.zen.fd.ping_timeout: 2s"
   , "node.data: " ++ if ncIsDataNode nc then "true" else "false"
   , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
   , "network.host: " ++ ncBindHost nc
@@ -209,13 +216,12 @@ writeToConsole = awaitForever $ \bs -> do
   yield bs
 
 checkStarted :: MonadIO m => IO () -> ConduitM B.ByteString B.ByteString m ()
-checkStarted onStarted = awaitForever $ \bs -> do
-  when ("started" `B.isInfixOf` bs) $ do
+checkStarted onStarted = awaitForever $ \bs ->
+  if "started" `B.isInfixOf` bs then do
     liftIO onStarted
     yield bs
     awaitForever yield
-
-  yield bs
+  else yield bs
 
 data ElasticsearchNode = ElasticsearchNode
   { esnConfig    :: NodeConfig
@@ -279,8 +285,8 @@ docker run
   saidStartedVar <- newTVarIO False
 
   nodeThread <- async $
-    withFile (stdoutPath nodeConfig) AppendMode $ \stdoutLog ->
-    withFile (stderrPath nodeConfig) AppendMode $ \stderrLog -> do
+    withLogFile (stdoutPath nodeConfig) $ \stdoutLog ->
+    withLogFile (stderrPath nodeConfig) $ \stderrLog -> do
 
     let concurrentConduit = Concurrently . runConduit
 
@@ -454,12 +460,12 @@ main = withCurrentRun $ \currentRun -> do
       unless (createIndexResult ^.. key "status" . _Number == []) -- TODO check for "acknowledged" too
         $ throwError $ "create index failed: " ++ show createIndexResult
 
-    let getNodeIdentities = bailOutOnTimeout 60000000 $ retryOnNodes $ \n -> do
+    let getNodeIdentities = bailOutOnTimeout 600000000 $ retryOnNodes $ \n -> do
           healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
           unless (healthResult ^.. key "status" . _String == ["green"])
             $ throwError $ "GET /_cluster/health did not return GREEN"
 
-          state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
+          state <- callApi n "GET" "/_cluster/state" $ object []
 
           let nodesFromIds nodeIds =
                 [ node
@@ -486,27 +492,34 @@ main = withCurrentRun $ \currentRun -> do
 
           return (masterNode, primaryNode, replicaNode)
 
-    when False $ do
-      (master, _, _) <- getNodeIdentities
+    do
+      (master, primary, replica) <- getNodeIdentities
+      writeLog master  "is master"
+      writeLog primary "is primary"
+      writeLog replica "is replica"
 
-      threadDelay 10000000
+      threadDelay 5000000
 
       writeLog currentRun $ "pausing " ++ nodeName master
       signalNode master "STOP"
 
-      void $ async $ do
-        threadDelay 100000000
-        writeLog currentRun $ "resuming " ++ nodeName master
-        signalNode master "CONT"
-
-    do 
-      (_, _, replica) <- getNodeIdentities
+      writeLog currentRun $ "disconnecting " ++ nodeName replica
       forM_ nodes $ breakLink replica
-      threadDelay 1000000
 
-      void $ async $ do
-        threadDelay 100000000
-        forM_ nodes $ restoreLink replica
+      threadDelay 20000000
+
+      (master', primary', replica') <- getNodeIdentities
+      writeLog master'  "is now master"
+      writeLog primary' "is now primary"
+      writeLog replica' "is now replica"
+
+      writeLog currentRun $ "resuming " ++ nodeName master
+      signalNode master "CONT"
+
+      writeLog currentRun $ "reconnecting " ++ nodeName replica
+      forM_ nodes $ restoreLink replica
+
+      threadDelay 5000000
 
     bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
       shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" $ object []
@@ -516,10 +529,10 @@ main = withCurrentRun $ \currentRun -> do
             , nodeId   <- shardCopyStats ^.. key "routing" . key "node"  . _String
             , docCount <- shardCopyStats ^.. key "docs"    . key "count" . _Number
             ]
-      liftIO $ writeLog currentRun $ "doc counts per node: " ++ show shardDocCounts
+      liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
       case shardDocCounts of
         [(nodeId1, docCount1), (nodeId2, docCount2)]
-          | docCount1 == docCount2 -> liftIO $ writeLog currentRun "shards have matching doc counts"
+          | docCount1 == docCount2 -> liftIO $ writeLog n "shards have matching doc counts"
         _ -> throwError $ "did not find matching doc counts: " ++ show shardDocCounts
 
     writeLog currentRun "finished"
