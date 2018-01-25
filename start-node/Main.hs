@@ -497,8 +497,8 @@ main = withCurrentRun $ \currentRun -> do
       withTrafficGenerator nodes $ do
         threadDelay 5000000
 
-        writeLog currentRun $ "pausing " ++ nodeName master
-        signalNode master "STOP"
+        -- writeLog currentRun $ "pausing " ++ nodeName master
+        -- signalNode master "STOP"
 
         writeLog currentRun $ "disconnecting " ++ nodeName replica
         forM_ nodes $ breakLink replica
@@ -510,8 +510,8 @@ main = withCurrentRun $ \currentRun -> do
         writeLog primary' "is now primary"
         writeLog replica' "is now replica"
 
-        writeLog currentRun $ "resuming " ++ nodeName master
-        signalNode master "CONT"
+        -- writeLog currentRun $ "resuming " ++ nodeName master
+        -- signalNode master "CONT"
 
         writeLog currentRun $ "reconnecting " ++ nodeName replica
         forM_ nodes $ restoreLink replica
