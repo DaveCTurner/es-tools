@@ -576,7 +576,7 @@ withTrafficGenerator allNodes go = do
   stateVar <- newTVarIO $ GeneratorState 0 Seq.empty rng
   let spawnGenerators [] = go
       spawnGenerators (n:ns) = withAsync (generateTrafficTo n stateVar) $ \_ -> spawnGenerators ns
-  spawnGenerators allNodes
+  spawnGenerators $ concat $ replicate 20 allNodes
 
 generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
 generateTrafficTo node stateVar = logOnExit $ do
@@ -598,7 +598,7 @@ generateTrafficTo node stateVar = logOnExit $ do
 
         else createDoc actionId
 
-    runExceptT $ callApi node "POST" "/synctest/_bulk" $ concatMap encodeAction actions
+    void $ runExceptT $ callApi node "POST" "/synctest/testdoc/_bulk" $ concatMap encodeAction actions
 
   where
   logOnExit go = go `finally` writeLog node "generateTrafficTo: finished"
