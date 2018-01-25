@@ -13,6 +13,7 @@ import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens hiding ((.=))
 import Control.Monad
+import Control.Monad.Except
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Resource
 import Data.Aeson
@@ -22,6 +23,7 @@ import Data.Conduit.Binary hiding (mapM_, take, head)
 import Data.Conduit.Process
 import Data.Hashable
 import Data.Maybe
+import Data.Monoid
 import Data.Streaming.Process
 import Data.Time
 import Data.Time.ISO8601
@@ -324,9 +326,10 @@ awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
 awaitExit :: ElasticsearchNode -> STM ExitCode
 awaitExit ElasticsearchNode{..} = waitSTM esnThread
 
-callApi :: ToJSON req => ElasticsearchNode -> B.ByteString -> String -> req -> IO (Maybe Value)
+callApi :: ToJSON req => ElasticsearchNode -> B.ByteString -> String -> req -> ExceptT String IO Value
 callApi node verb path reqBody = do
-  rawReq <- parseRequest $ printf "http://%s:%d%s" (ncBindHost $ esnConfig node) (ncHttpPort $ esnConfig node) path
+  let requestUri = printf "http://%s:%d%s" (ncBindHost $ esnConfig node) (ncHttpPort $ esnConfig node) path
+  rawReq <- maybe (throwError $ "parseRequest failed: '" ++ requestUri ++ "'") return $ parseRequest requestUri
   let req = rawReq
         { method         = verb
         , requestHeaders = requestHeaders rawReq ++ [(hContentType, "application/json")]
@@ -334,7 +337,40 @@ callApi node verb path reqBody = do
         }
       manager = crManager $ ncCurrentRun $ esnConfig node
 
-  withResponse req manager $ \response -> decode . BL.fromChunks <$> brConsume (responseBody response)
+      go = withResponse req manager $ \response -> eitherDecode . BL.fromChunks <$> brConsume (responseBody response)
+      goSafe = (Right <$> go) `catch` (return . Left)
+
+  liftIO goSafe >>= \case
+    Left e -> throwError $ "callApi failed: " ++ show (e :: HttpException)
+    Right (Left msg) -> throwError $ "decode failed: " ++ msg
+    Right (Right v) -> return v
+
+bothWays :: Applicative m => (ElasticsearchNode -> ElasticsearchNode -> m ()) -> ElasticsearchNode -> ElasticsearchNode -> m ()
+bothWays go n1 n2 = (<>) <$> go n1 n2 <*> go n2 n1
+
+breakLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+breakLink = bothWays breakDirectedLink
+
+breakDirectedLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+breakDirectedLink n1 n2 = do
+  callProcess "sudo" [ "iptables", "-I", "DOCKER-USER"
+                     , "--source",      ncBindHost (esnConfig n1)
+                     , "--destination", ncBindHost (esnConfig n2)
+                     , "--protocol", "tcp"
+                     , "--jump", "REJECT", "--reject-with", "tcp-reset"
+                     ]
+
+restoreLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+restoreLink = bothWays restoreDirectedLink
+
+restoreDirectedLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+restoreDirectedLink n1 n2 = do
+  callProcess "sudo" [ "iptables", "-I", "DOCKER-USER"
+                     , "--source",      ncBindHost (esnConfig n1)
+                     , "--destination", ncBindHost (esnConfig n2)
+                     , "--protocol", "tcp"
+                     , "--jump", "REJECT", "--reject-with", "tcp-reset"
+                     ]
 
 main :: IO ()
 main = withCurrentRun $ \currentRun -> do
@@ -371,9 +407,23 @@ main = withCurrentRun $ \currentRun -> do
         writeLog currentRun msg
         error msg
 
+      bailOutOnError go = either bailOut return =<< runExceptT go
+
+      bailOutOnTimeout t go = maybe (bailOut "bailOutOnTimeout: timed out") return =<< timeout t go
+
   bracket (mapM runNode nodeConfigs) killRemainingNodes $ \nodes -> do
 
     let nodesByName = HM.fromList [(nodeName n, n) | n <- nodes]
+
+        retryOnNodes withNode = go (cycle nodes)
+          where
+          go [] = bailOut "retryOnNodes: impossible: ran out of nodes"
+          go (n:ns) = either goAgain return =<< runExceptT (withNode n)
+            where
+              goAgain msg = do
+                writeLog n $ "retryOnNode: failed: " ++ msg
+                threadDelay 1000000
+                go ns
 
     startedFlags <- forM nodes $ \n -> do
       result <- atomically $ awaitStarted n
@@ -382,77 +432,76 @@ main = withCurrentRun $ \currentRun -> do
 
     unless (and startedFlags) $ bailOut "not all nodes started successfully"
 
-    createIndexResult <- callApi (head nodes) "PUT" "/synctest" $ object
-      [ "settings" .= object
-        [ "index" .= object
-          [ "number_of_shards"   .= Number 1
-          , "number_of_replicas" .= Number 1
+    bailOutOnTimeout 10000000 $ retryOnNodes $ \n -> do
+      createIndexResult <- callApi n "PUT" "/synctest" $ object
+        [ "settings" .= object
+          [ "index" .= object
+            [ "number_of_shards"   .= Number 1
+            , "number_of_replicas" .= Number 1
+            ]
           ]
-        ]
-      , "mappings" .= object
-        [ "testdoc" .= object
-          [ "properties" .= object
-            [ "serial"  .= object [ "type" .= String "integer" ]
-            , "updated" .= object [ "type" .= String "long" ]
+        , "mappings" .= object
+          [ "testdoc" .= object
+            [ "properties" .= object
+              [ "serial"  .= object [ "type" .= String "integer" ]
+              , "updated" .= object [ "type" .= String "long" ]
+              ]
             ]
           ]
         ]
-      ]
 
-    unless (createIndexResult ^.. _Just . key "status" . _Number == [])
-      $ bailOut $ "create index failed: " ++ show createIndexResult
+      unless (createIndexResult ^.. key "status" . _Number == []) -- TODO check for "acknowledged" too
+        $ throwError $ "create index failed: " ++ show createIndexResult
 
-    let getNodeIdentities = go $ cycle nodes
-          where
-            go [] = bailOut "getNodeIdentities: ran out of nodes"
-            go (n:ns) = do
-              let goAgain = do
-                    threadDelay 1000000
-                    go ns
+    let getNodeIdentities = bailOutOnTimeout 60000000 $ retryOnNodes $ \n -> do
+          healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
+          unless (healthResult ^.. key "status" . _String == ["green"])
+            $ throwError $ "GET /_cluster/health did not return GREEN"
 
-              healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
-              if healthResult ^.. _Just . key "status" . _String /= ["green"]
-                then goAgain
-                else do
+          state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
 
-                  state <- callApi (head nodes) "GET" "/_cluster/state" $ object []
+          let nodesFromIds nodeIds =
+                [ node
+                | nodeId <- nodeIds
+                , nodeName <- state ^.. key "nodes" . key nodeId . key "name" . _String . to T.unpack
+                , Just node <- [HM.lookup nodeName nodesByName]
+                ]
 
-                  let nodesFromIds nodeIds =
-                        [ node
-                        | nodeId <- nodeIds
-                        , nodeName <- state ^.. _Just . key "nodes" . key nodeId . key "name" . _String . to T.unpack
-                        , Just node <- [HM.lookup nodeName nodesByName]
-                        ]
+              getUniqueNode nodeType = \case
+                [x] -> return x
+                notUnique -> throwError $ printf "unique %s not found: got %s" (nodeType::String) (show $ map nodeName notUnique)
 
-                      getUniqueNode :: String -> [ElasticsearchNode] -> IO ElasticsearchNode
-                      getUniqueNode nodeType = \case
-                        [x] -> return x
-                        notUnique -> bailOut $ printf "unique %s not found: got %s" nodeType (show $ map nodeName notUnique)
+          masterNode <- getUniqueNode "master" $ nodesFromIds $ state ^.. key "master_node" . _String
 
-                  masterNode <- getUniqueNode "master" $ nodesFromIds $ state ^.. _Just . key "master_node" . _String
+          let shardCopyNodeIds =
+                [ (nodeId, isPrimary)
+                | routingTableEntry <- state ^.. key "routing_table" . key "indices" . key "synctest" . key "shards" . key "0" . values
+                , nodeId    <- routingTableEntry ^.. key "node" . _String
+                , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
+                ]
 
-                  let shardCopyNodeIds =
-                        [ (nodeId, isPrimary)
-                        | routingTableEntry <- state ^.. _Just . key "routing_table" . key "indices" . key "synctest" . key "shards" . key "0" . values
-                        , nodeId    <- routingTableEntry ^.. key "node" . _String
-                        , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
-                        ]
+          primaryNode <- getUniqueNode "primary" $ nodesFromIds [n | (n, True)  <- shardCopyNodeIds]
+          replicaNode <- getUniqueNode "replica" $ nodesFromIds [n | (n, False) <- shardCopyNodeIds]
 
-                  primaryNode <- getUniqueNode "primary" $ nodesFromIds [n | (n, True)  <- shardCopyNodeIds]
-                  replicaNode <- getUniqueNode "replica" $ nodesFromIds [n | (n, False) <- shardCopyNodeIds]
+          return (masterNode, primaryNode, replicaNode)
 
-                  return (masterNode, primaryNode, replicaNode)
-
-    do
-      (master, primary, replica) <- getNodeIdentities
+    when False $ do
+      (master, _, _) <- getNodeIdentities
 
       threadDelay 10000000
 
       writeLog currentRun $ "pausing " ++ nodeName master
       signalNode master "STOP"
-      threadDelay 100000000
 
-      writeLog currentRun $ "resuming " ++ nodeName master
-      signalNode master "CONT"
+      void $ async $ do
+        threadDelay 100000000
+        writeLog currentRun $ "resuming " ++ nodeName master
+        signalNode master "CONT"
+
+    do 
+      (_, _, replica) <- getNodeIdentities
+      forM_ nodes $ breakLink replica
+      threadDelay 100000000
+      forM_ nodes $ restoreLink replica
 
     writeLog currentRun "finished"

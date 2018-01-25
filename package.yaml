@@ -20,6 +20,7 @@ dependencies:
 - iso8601-time
 - lens
 - lens-aeson
+- mtl
 - process
 - resourcet
 - stm
