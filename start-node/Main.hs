@@ -189,6 +189,10 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
   , "xpack.ml.enabled: false"
+  , "logger.org.elasticsearch.action.bulk: TRACE"
+  , "logger.org.elasticsearch.cluster.service: DEBUG"
+  , "logger.org.elasticsearch.indices.recovery: TRACE"
+  , "logger.org.elasticsearch.index.shard: TRACE"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -263,23 +267,6 @@ runNode nodeConfig = do
         { cwd = Just $ crWorkingDirectory $ ncCurrentRun nodeConfig
         , env = Just []
         }
-{-
-
-Docker used this:
-
-docker network create --driver=bridge --subnet=10.10.10.0/24 --ip-range=10.10.10.0/24 --opt com.docker.network.bridge.name=br0 br0
-
-docker run
-  --mount type=bind,source="$(pwd)"/test-data/node1,target=/usr/share/elasticsearch/data
-  --mount type=bind,source=/sbin,target=/opt/host/sbin
-  --network br0
-  --mount type=bind,source="$(pwd)"/docker-elasticsearch.yml,target=/usr/share/elasticsearch/config/elasticsearch.yml
-  --name es0
-  --rm
-  --ip 10.10.10.101
-  docker.elastic.co/elasticsearch/elasticsearch:5.4.3
-
--}
 
   withProcessHandle (streamingProcessHandleRaw sph) $ \case
     OpenHandle pid -> writeLog nodeConfig $ "started with PID " ++ show pid
@@ -302,9 +289,9 @@ docker run
           terminateProcess $ streamingProcessHandleRaw sph
 
     ((), ()) <- runConcurrently ((,)
-        <$> concurrentConduit (sourceStdout =$= writeToConsole =$= checkStarted onStarted
+        <$> concurrentConduit (sourceStdout                    =$= checkStarted onStarted
                                                                =$= sinkHandle stdoutLog)
-        <*> concurrentConduit (sourceStderr =$= writeToConsole =$= sinkHandle stderrLog))
+        <*> concurrentConduit (sourceStderr                    =$= sinkHandle stderrLog))
       `finally`     (closeStdout >> closeStderr)
       `onException` terminateAndLog
 
