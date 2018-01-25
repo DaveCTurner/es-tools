@@ -64,22 +64,35 @@ instance CanLog CurrentRun where
 newtype DockerNetwork = DockerNetwork { _unDockerNetwork :: String }
   deriving (Show, Eq)
 
-dockerNetworkCreate :: String -> IO DockerNetwork
-dockerNetworkCreate networkName = DockerNetwork <$> do
+dockerNetworkCreate :: (String -> IO ()) -> String -> IO DockerNetwork
+dockerNetworkCreate writeLog networkName = DockerNetwork <$> do
 
   let args = ["network", "create", "--driver=bridge", "--subnet=10.10.10.0/24", "--ip-range=10.10.10.0/24"
              ,"--opt", "com.docker.network.bridge.name=" ++ networkName, networkName]
 
-  putStrLn $ unwords args
+  writeLog $ "dockerNetworkCreate: running docker " ++ unwords args
 
   (ec, stdout, stderr) <- readProcessWithExitCode "docker" args ""
 
   if null stderr && ec == ExitSuccess
     then return $ filter (> ' ') stdout
-    else error ("docker network create failed: " ++ stderr)
+    else do
+      writeLog $ "dockerNetworkCreate: docker " ++ unwords args ++ " exited with " ++ show ec ++ " yielding '" ++ stderr ++ "'"
+      error "docker network create failed"
 
-dockerNetworkRemove :: DockerNetwork-> IO ()
-dockerNetworkRemove dockerNetwork = callProcess "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
+callProcessNoThrow :: (String -> IO ()) -> FilePath -> [String] -> IO ()
+callProcessNoThrow writeLog exe args = do
+  let description = unwords $ exe : args
+  writeLog $ "callProcessNoThrow: running " ++ description
+  (ec, _, _) <- readProcessWithExitCode exe args ""
+  case ec of
+    ExitSuccess   -> return ()
+    ExitFailure c -> writeLog $ printf "callProcessNoThrow: %s exited with code %d" description c
+
+dockerNetworkRemove :: (String -> IO ()) -> DockerNetwork-> IO ()
+dockerNetworkRemove writeLog dockerNetwork = do
+  threadDelay 1000000
+  callProcessNoThrow writeLog "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
 
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
@@ -88,13 +101,9 @@ withCurrentRun go = do
   let workingDirectory = cwd </> "output" </> runName
       networkName = "elasticnet"
 
-  createElasticDirectory workingDirectory
+  createElasticDirectory putStrLn workingDirectory
 
-  withFile (workingDirectory </> "run.log") WriteMode $ \hLog ->
-    bracket (dockerNetworkCreate networkName) dockerNetworkRemove $ \dockerNetwork -> do
-
-    putStrLn $ "Using docker network " ++ show dockerNetwork
-
+  withFile (workingDirectory </> "run.log") WriteMode $ \hLog -> do
     logLock <- newMVar ()
 
     let writeLogCurrentRun msg = withMVar logLock $ \() -> do
@@ -105,14 +114,20 @@ withCurrentRun go = do
 
     manager <- newManager defaultManagerSettings
 
-    writeLogCurrentRun $ printf "Starting run with working directory: " ++ workingDirectory
-    go CurrentRun
-      { crName             = runName
-      , crWorkingDirectory = workingDirectory
-      , crWriteLog         = writeLogCurrentRun
-      , crManager          = manager
-      , crDockerNetwork    = dockerNetwork
-      }
+    writeLogCurrentRun $ "Starting run with working directory: " ++ workingDirectory
+
+    bracket (dockerNetworkCreate writeLogCurrentRun networkName) 
+            (dockerNetworkRemove writeLogCurrentRun) $ \dockerNetwork -> do
+
+      writeLogCurrentRun $ "Using docker network " ++ show dockerNetwork
+
+      go CurrentRun
+        { crName             = runName
+        , crWorkingDirectory = workingDirectory
+        , crWriteLog         = writeLogCurrentRun
+        , crManager          = manager
+        , crDockerNetwork    = dockerNetwork
+        }
 
 data NodeConfig = NodeConfig
   { ncCurrentRun           :: CurrentRun
@@ -161,18 +176,20 @@ sourceConfig nc = mapM_ yieldString
 yieldString :: Monad m => String -> Producer m B.ByteString
 yieldString = yield . T.encodeUtf8 . T.pack . (++ "\n")
 
-createElasticDirectory :: FilePath -> IO ()
-createElasticDirectory path = do
+createElasticDirectory :: (String -> IO ()) -> FilePath -> IO ()
+createElasticDirectory writeLog path = do
   createDirectoryIfMissing True path
-  callProcess "sudo" ["chown", "elastic:elastic", path]
+  let args = ["chown", "elastic:elastic", path]
+  writeLog $ "createElasticDirectory: sudo " ++ unwords args
+  callProcess "sudo" args
 
 makeConfig :: NodeConfig -> IO ()
 makeConfig nc = do
   writeLog nc "makeConfig"
 
-  createElasticDirectory $ configDirectory nc
-  createElasticDirectory $ nodeWorkingDirectory nc </> "data"
-  createElasticDirectory $ nodeWorkingDirectory nc </> "logs"
+  createElasticDirectory (writeLog nc) $ configDirectory nc
+  createElasticDirectory (writeLog nc) $ nodeWorkingDirectory nc </> "data"
+  createElasticDirectory (writeLog nc) $ nodeWorkingDirectory nc </> "logs"
 
   runResourceT $ runConduit
      $  sourceConfig nc
@@ -286,8 +303,8 @@ docker run
     }
 
 signalNode :: ElasticsearchNode -> String -> IO ()
-signalNode n@ElasticsearchNode{..} signal = callProcess "docker"
-  ["kill", "--signal", signal, ncName esnConfig]
+signalNode n@ElasticsearchNode{..} signal =
+  callProcessNoThrow (writeLog n) "docker" ["kill", "--signal", signal, ncName esnConfig]
 
 awaitStarted :: ElasticsearchNode -> STM Bool
 awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
