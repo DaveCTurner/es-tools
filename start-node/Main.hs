@@ -37,13 +37,16 @@ import System.IO
 import System.Posix.Signals
 import System.Process
 import System.Process.Internals
+import System.Random
 import System.Timeout
 import Text.Printf
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.HashMap.Strict as HM
+import qualified Data.Sequence as Seq
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
-import qualified Data.HashMap.Strict as HM
 
 terminateStreamingProcess :: StreamingProcessHandle -> IO ()
 terminateStreamingProcess = terminateProcess . streamingProcessHandleRaw
@@ -332,14 +335,19 @@ awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
 awaitExit :: ElasticsearchNode -> STM ExitCode
 awaitExit ElasticsearchNode{..} = waitSTM esnThread
 
-callApi :: ToJSON req => ElasticsearchNode -> B.ByteString -> String -> req -> ExceptT String IO Value
+callApi :: ElasticsearchNode -> B.ByteString -> String -> [Value] -> ExceptT String IO Value
 callApi node verb path reqBody = do
   let requestUri = printf "http://%s:%d%s" (ncBindHost $ esnConfig node) (ncHttpPort $ esnConfig node) path
   rawReq <- maybe (throwError $ "parseRequest failed: '" ++ requestUri ++ "'") return $ parseRequest requestUri
   let req = rawReq
         { method         = verb
-        , requestHeaders = requestHeaders rawReq ++ [(hContentType, "application/json")]
-        , requestBody    = RequestBodyLBS $ encode reqBody
+        , requestHeaders = requestHeaders rawReq
+                              ++ [(hContentType, "application/json")     | length reqBody == 1]
+                              ++ [(hContentType, "application/x-ndjson") | length reqBody >  1]
+        , requestBody    = case reqBody of
+            [] -> RequestBodyLBS BL.empty
+            [oneObject] -> RequestBodyLBS $ encode oneObject
+            manyObjects -> RequestBodyBuilder 1024 $ mconcat [ B.lazyByteString (encode obj) <> B.word8 0x0a | obj <- manyObjects ]
         }
       manager = crManager $ ncCurrentRun $ esnConfig node
 
@@ -439,19 +447,20 @@ main = withCurrentRun $ \currentRun -> do
     unless (and startedFlags) $ bailOut "not all nodes started successfully"
 
     bailOutOnTimeout 10000000 $ retryOnNodes $ \n -> do
-      createIndexResult <- callApi n "PUT" "/synctest" $ object
-        [ "settings" .= object
-          [ "index" .= object
-            [ "number_of_shards"   .= Number 1
-            , "number_of_replicas" .= Number 1
-            , "unassigned.node_left.delayed_timeout" .= String "5s"
+      createIndexResult <- callApi n "PUT" "/synctest" [object
+          [ "settings" .= object
+            [ "index" .= object
+              [ "number_of_shards"   .= Number 1
+              , "number_of_replicas" .= Number 1
+              , "unassigned.node_left.delayed_timeout" .= String "5s"
+              ]
             ]
-          ]
-        , "mappings" .= object
-          [ "testdoc" .= object
-            [ "properties" .= object
-              [ "serial"  .= object [ "type" .= String "integer" ]
-              , "updated" .= object [ "type" .= String "long" ]
+          , "mappings" .= object
+            [ "testdoc" .= object
+              [ "properties" .= object
+                [ "serial"  .= object [ "type" .= String "long" ]
+                , "updated" .= object [ "type" .= String "long" ]
+                ]
               ]
             ]
           ]
@@ -461,11 +470,11 @@ main = withCurrentRun $ \currentRun -> do
         $ throwError $ "create index failed: " ++ show createIndexResult
 
     let getNodeIdentities = bailOutOnTimeout 600000000 $ retryOnNodes $ \n -> do
-          healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" $ object []
+          healthResult <- callApi n "GET" "/_cluster/health?wait_for_status=green&timeout=20s" []
           unless (healthResult ^.. key "status" . _String == ["green"])
             $ throwError $ "GET /_cluster/health did not return GREEN"
 
-          state <- callApi n "GET" "/_cluster/state" $ object []
+          state <- callApi n "GET" "/_cluster/state" []
 
           let nodesFromIds nodeIds =
                 [ node
@@ -498,31 +507,34 @@ main = withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      threadDelay 5000000
+      withTrafficGenerator nodes $ do
+        threadDelay 5000000
 
-      writeLog currentRun $ "pausing " ++ nodeName master
-      signalNode master "STOP"
+        writeLog currentRun $ "pausing " ++ nodeName master
+        signalNode master "STOP"
 
-      writeLog currentRun $ "disconnecting " ++ nodeName replica
-      forM_ nodes $ breakLink replica
+        writeLog currentRun $ "disconnecting " ++ nodeName replica
+        forM_ nodes $ breakLink replica
 
-      threadDelay 20000000
+        threadDelay 20000000
 
-      (master', primary', replica') <- getNodeIdentities
-      writeLog master'  "is now master"
-      writeLog primary' "is now primary"
-      writeLog replica' "is now replica"
+        (master', primary', replica') <- getNodeIdentities
+        writeLog master'  "is now master"
+        writeLog primary' "is now primary"
+        writeLog replica' "is now replica"
 
-      writeLog currentRun $ "resuming " ++ nodeName master
-      signalNode master "CONT"
+        writeLog currentRun $ "resuming " ++ nodeName master
+        signalNode master "CONT"
 
-      writeLog currentRun $ "reconnecting " ++ nodeName replica
-      forM_ nodes $ restoreLink replica
+        writeLog currentRun $ "reconnecting " ++ nodeName replica
+        forM_ nodes $ restoreLink replica
 
-      threadDelay 5000000
+        threadDelay 5000000
+
+    threadDelay 5000000
 
     bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
-      shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" $ object []
+      shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
       let shardDocCounts =
             [ (nodeId, docCount)
             | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
@@ -536,3 +548,85 @@ main = withCurrentRun $ \currentRun -> do
         _ -> throwError $ "did not find matching doc counts: " ++ show shardDocCounts
 
     writeLog currentRun "finished"
+
+data GeneratorState = GeneratorState
+  { gsNextSerial  :: Int
+  , gsCurrentDocs :: Seq.Seq Int
+  , gsRng         :: StdGen
+  }
+
+data Action = CreateDoc !Int | UpdateDoc !Int !Int | DeleteDoc !Int deriving (Show, Eq)
+
+encodeAction :: Action -> [Value]
+encodeAction (CreateDoc docId) =
+  [ object ["index" .= object ["_id" .= docId]]
+  , object ["serial" .= docId, "updated" .= docId]
+  ]
+encodeAction (UpdateDoc docId actId) =
+  [ object ["update" .= object ["_id" .= docId]]
+  , object ["doc" .= object ["serial" .= docId, "updated" .= actId]]
+  ]
+encodeAction (DeleteDoc docId) =
+  [ object ["delete" .= object ["_id" .= docId]]
+  ]
+
+withTrafficGenerator :: [ElasticsearchNode] -> IO a -> IO a
+withTrafficGenerator allNodes go = do
+  rng <- getStdGen
+  stateVar <- newTVarIO $ GeneratorState 0 Seq.empty rng
+  let spawnGenerators [] = go
+      spawnGenerators (n:ns) = withAsync (generateTrafficTo n stateVar) $ \_ -> spawnGenerators ns
+  spawnGenerators allNodes
+
+generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
+generateTrafficTo node stateVar = logOnExit $ do
+  writeLog node "generateTrafficTo: starting"
+  forever $ do
+    actions <- replicateM 1000 $ atomically $ do
+      actionId <- nextSerial
+      docs <- gsCurrentDocs <$> readTVar stateVar
+      let currentDocCount = Seq.length docs
+      let maxPosition = max currentDocCount 10000
+      position <- withRng $ randomR (0, maxPosition)
+      if position < currentDocCount
+        then do
+          let docId = Seq.index docs position
+          shouldDelete <- (< 0.2) <$> withRng (randomR (0.0, 1.0 :: Double))
+          if shouldDelete
+            then deleteDoc position docId
+            else return $! UpdateDoc docId actionId
+
+        else createDoc actionId
+
+    runExceptT $ callApi node "POST" "/synctest/_bulk" $ concatMap encodeAction actions
+
+  where
+  logOnExit go = go `finally` writeLog node "generateTrafficTo: finished"
+
+  nextSerial :: STM Int
+  nextSerial = do
+    gs <- readTVar stateVar
+    let n = gsNextSerial gs
+    writeTVar stateVar $ gs { gsNextSerial = n + 1}
+    return n
+
+  withRng f = do
+    gs <- readTVar stateVar
+    let (a, rng') = f (gsRng gs)
+    writeTVar stateVar gs { gsRng = rng' }
+    return a
+
+  updateCurrentDocs f = modifyTVar stateVar $ \gs -> gs { gsCurrentDocs = f $ gsCurrentDocs gs }
+
+  createDoc docId = do
+    updateCurrentDocs (Seq.|> docId)
+    return $! CreateDoc docId
+
+  deleteDoc position docId = do
+    updateCurrentDocs (deleteSeqElemAt position)
+    return $! DeleteDoc docId
+
+deleteSeqElemAt :: Int -> Seq.Seq a -> Seq.Seq a
+deleteSeqElemAt i xs = before <> Seq.drop 1 notBefore
+  where
+  (before, notBefore) = Seq.splitAt i xs

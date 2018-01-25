@@ -12,6 +12,7 @@ dependencies:
 - bytestring
 - conduit
 - conduit-extra
+- containers
 - directory
 - filepath
 - hashable
@@ -22,6 +23,7 @@ dependencies:
 - lens-aeson
 - mtl
 - process
+- random
 - resourcet
 - stm
 - streaming-commons
