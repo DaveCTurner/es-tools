@@ -534,25 +534,39 @@ main = withCurrentRun $ \currentRun -> do
         threadDelay 5000000
 
       threadDelay 5000000
+
+    do
+      (master, primary, replica) <- getNodeIdentities
+      void $ runExceptT $ callApi primary "POST" "/_refresh" []
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
 
-    threadDelay 5000000
-
-    bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
-      void $ callApi n "GET" "/_tasks?detailed" []
-      shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
-      let shardDocCounts =
-            [ (nodeId, docCount - delCount)
-            | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
-            , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
-            , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Number
-            , delCount <- shardCopyStats ^.. key "docs"    . key "deleted" . _Number
-            ]
-      liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
-      case shardDocCounts of
-        [(nodeId1, docCount1), (nodeId2, docCount2)]
-          | docCount1 == docCount2 -> liftIO $ writeLog n "shards have matching doc counts"
-        _ -> throwError $ "did not find matching doc counts: " ++ show shardDocCounts
+      bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
+        void $ callApi n "GET" "/_tasks?detailed" []
+        shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
+        let shardDocCounts =
+              [ (nodeId, docCount - delCount)
+              | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
+              , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
+              , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Number
+              , delCount <- shardCopyStats ^.. key "docs"    . key "deleted" . _Number
+              ]
+        liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
+        case shardDocCounts of
+          [(nodeId1, docCount1), (nodeId2, docCount2)]
+            | docCount1 == docCount2 -> liftIO $ writeLog n "shards have matching doc counts"
+            | otherwise -> do
+                liftIO $ writeLog n "shards have non-matching doc counts"
+                void $ callApi primary "POST" "/_refresh" []
+                void $ callApi primary "GET" "/synctest/testdoc/_search?preference=_primary" [ object
+                  [ "query" .= object ["match_all" .= object []]
+                  , "size"  .= (1 + max docCount1 docCount2)
+                  ]]
+                void $ callApi replica "GET" "/synctest/testdoc/_search?preference=_replica" [ object
+                  [ "query" .= object ["match_all" .= object []]
+                  , "size"  .= (1 + max docCount1 docCount2)
+                  ]]
+                throwError $ "found mis-matching doc-counts: " ++ show shardDocCounts
+          _ -> throwError $ "did not find doc counts: " ++ show shardDocCounts
 
     writeLog currentRun "finished"
 
