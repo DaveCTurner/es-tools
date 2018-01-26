@@ -58,6 +58,7 @@ data CurrentRun = CurrentRun
   { crName             :: String
   , crWorkingDirectory :: FilePath
   , crWriteLog         :: String -> IO ()
+  , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
   , crManager          :: Manager
   , crDockerNetwork    :: DockerNetwork
   }
@@ -120,8 +121,10 @@ withCurrentRun go = do
 
   createElasticDirectory putStrLn workingDirectory
 
-  withLogFile (workingDirectory </> "run.log") $ \hLog -> do
+  withLogFile (workingDirectory </> "run.log") $ \hLog ->
+    withLogFile (workingDirectory </> "api.log") $ \hApiLog -> do
     logLock <- newMVar ()
+    apiLogLock <- newMVar ()
 
     let writeLogCurrentRun msg = withMVar logLock $ \() -> do
           now <- formatISO8601Micros <$> getCurrentTime
@@ -129,6 +132,11 @@ withCurrentRun go = do
           putStrLn fullMsg
           hPutStrLn hLog fullMsg
           hFlush hLog
+
+        writeApiLog method url request response = withMVar apiLogLock $ \() -> do
+          now <- formatISO8601Micros <$> getCurrentTime
+          hPutStrLn hApiLog $ printf "[%s] %s %s" now (show method) url
+          BL.hPut hApiLog $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
 
     manager <- newManager defaultManagerSettings
 
@@ -144,6 +152,7 @@ withCurrentRun go = do
         { crName             = runName
         , crWorkingDirectory = workingDirectory
         , crWriteLog         = writeLogCurrentRun
+        , crWriteApiLog      = writeApiLog
         , crManager          = manager
         , crDockerNetwork    = dockerNetwork
         }
@@ -331,20 +340,26 @@ awaitExit ElasticsearchNode{..} = waitSTM esnThread
 callApi :: ElasticsearchNode -> B.ByteString -> String -> [Value] -> ExceptT String IO Value
 callApi node verb path reqBody = do
   let requestUri = printf "http://%s:%d%s" (ncBindHost $ esnConfig node) (ncHttpPort $ esnConfig node) path
+      reqBodyBuilder = case reqBody of
+        [] -> mempty
+        [oneObject] -> B.lazyByteString (encode oneObject)
+        manyObjects -> mconcat [ B.lazyByteString (encode obj) <> B.word8 0x0a | obj <- manyObjects ]
+      reqBodyBytes = B.toLazyByteString reqBodyBuilder
+
   rawReq <- maybe (throwError $ "parseRequest failed: '" ++ requestUri ++ "'") return $ parseRequest requestUri
   let req = rawReq
         { method         = verb
         , requestHeaders = requestHeaders rawReq
                               ++ [(hContentType, "application/json")     | length reqBody == 1]
                               ++ [(hContentType, "application/x-ndjson") | length reqBody >  1]
-        , requestBody    = case reqBody of
-            [] -> RequestBodyLBS BL.empty
-            [oneObject] -> RequestBodyLBS $ encode oneObject
-            manyObjects -> RequestBodyBuilder 1024 $ mconcat [ B.lazyByteString (encode obj) <> B.word8 0x0a | obj <- manyObjects ]
+        , requestBody    = RequestBodyLBS reqBodyBytes
         }
       manager = crManager $ ncCurrentRun $ esnConfig node
 
-      go = withResponse req manager $ \response -> eitherDecode . BL.fromChunks <$> brConsume (responseBody response)
+      go = withResponse req manager $ \response -> do
+        fullResponse <- BL.fromChunks <$> brConsume (responseBody response)
+        crWriteApiLog (ncCurrentRun $ esnConfig node) verb requestUri reqBodyBytes fullResponse
+        return $ eitherDecode fullResponse
       goSafe = (Right <$> go) `catch` (return . Left)
 
   liftIO goSafe >>= \case
@@ -526,6 +541,7 @@ main = withCurrentRun $ \currentRun -> do
     threadDelay 5000000
 
     bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
+      void $ callApi n "GET" "/_tasks?detailed" []
       shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
       let shardDocCounts =
             [ (nodeId, docCount)
