@@ -538,6 +538,8 @@ main = withCurrentRun $ \currentRun -> do
 
         threadDelay 5000000
 
+      void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
+
     threadDelay 5000000
 
     bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
