@@ -563,6 +563,7 @@ main = withCurrentRun $ \currentRun -> do
             | otherwise -> do
                 liftIO $ writeLog n "shards have non-matching doc counts"
                 void $ callApi primary "POST" "/_refresh" []
+                void $ callApi primary "GET" "/_cat/shards" []
                 void $ callApi primary "GET" "/synctest/testdoc/_search?preference=_primary" [ object
                   [ "query" .= object ["match_all" .= object []]
                   , "size"  .= (1 + max docCount1 docCount2)
