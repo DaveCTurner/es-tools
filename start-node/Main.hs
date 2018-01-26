@@ -518,11 +518,11 @@ main = withCurrentRun $ \currentRun -> do
       withTrafficGenerator nodes $ do
         threadDelay 5000000
 
-        writeLog currentRun $ "pausing " ++ nodeName master
-        signalNode master "STOP"
+        writeLog currentRun $ "terminating " ++ nodeName master
+        signalNode master "TERM"
 
-        writeLog currentRun $ "disconnecting " ++ nodeName replica
-        forM_ nodes $ breakLink replica
+        writeLog currentRun $ "terminating " ++ nodeName replica
+        signalNode replica "TERM"
 
         threadDelay 20000000
 
@@ -531,14 +531,9 @@ main = withCurrentRun $ \currentRun -> do
         writeLog primary' "is now primary"
         writeLog replica' "is now replica"
 
-        writeLog currentRun $ "resuming " ++ nodeName master
-        signalNode master "CONT"
-
-        writeLog currentRun $ "reconnecting " ++ nodeName replica
-        forM_ nodes $ restoreLink replica
-
         threadDelay 5000000
 
+      threadDelay 5000000
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
 
     threadDelay 5000000
