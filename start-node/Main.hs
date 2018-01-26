@@ -461,6 +461,7 @@ main = withCurrentRun $ \currentRun -> do
               [ "number_of_shards"   .= Number 1
               , "number_of_replicas" .= Number 1
               , "unassigned.node_left.delayed_timeout" .= String "5s"
+              , "max_result_window" .= Number 1000000
               ]
             ]
           , "mappings" .= object
