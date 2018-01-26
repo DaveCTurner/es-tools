@@ -547,10 +547,11 @@ main = withCurrentRun $ \currentRun -> do
       void $ callApi n "GET" "/_tasks?detailed" []
       shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
       let shardDocCounts =
-            [ (nodeId, docCount)
+            [ (nodeId, docCount - delCount)
             | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
-            , nodeId   <- shardCopyStats ^.. key "routing" . key "node"  . _String
-            , docCount <- shardCopyStats ^.. key "docs"    . key "count" . _Number
+            , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
+            , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Number
+            , delCount <- shardCopyStats ^.. key "docs"    . key "deleted" . _Number
             ]
       liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
       case shardDocCounts of
