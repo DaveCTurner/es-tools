@@ -500,7 +500,7 @@ main = withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      withTrafficGenerator nodes $ do
+      withTrafficGenerator [primary] $ do
         threadDelay 5000000
 
         -- writeLog currentRun $ "pausing " ++ nodeName master
@@ -569,7 +569,7 @@ withTrafficGenerator allNodes go = do
   stateVar <- newTVarIO $ GeneratorState 0 Seq.empty rng
   let spawnGenerators [] = go
       spawnGenerators (n:ns) = withAsync (generateTrafficTo n stateVar) $ \_ -> spawnGenerators ns
-  spawnGenerators $ concat $ replicate 20 allNodes
+  spawnGenerators $ concat $ replicate 10 allNodes
 
 generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
 generateTrafficTo node stateVar = logOnExit $ do
