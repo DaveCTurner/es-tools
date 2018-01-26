@@ -452,7 +452,6 @@ main = withCurrentRun $ \currentRun -> do
             [ "testdoc" .= object
               [ "properties" .= object
                 [ "serial"  .= object [ "type" .= String "long" ]
-                , "updated" .= object [ "type" .= String "long" ]
                 ]
               ]
             ]
@@ -548,16 +547,12 @@ data GeneratorState = GeneratorState
   , gsRng         :: StdGen
   }
 
-data Action = CreateDoc !Int | UpdateDoc !Int !Int | DeleteDoc !Int deriving (Show, Eq)
+data Action = CreateDoc !Int | DeleteDoc !Int deriving (Show, Eq)
 
 encodeAction :: Action -> [Value]
 encodeAction (CreateDoc docId) =
   [ object ["index" .= object ["_id" .= docId]]
-  , object ["serial" .= docId, "updated" .= docId]
-  ]
-encodeAction (UpdateDoc docId actId) =
-  [ object ["update" .= object ["_id" .= docId]]
-  , object ["doc" .= object ["serial" .= docId, "updated" .= actId]]
+  , object ["serial" .= docId]
   ]
 encodeAction (DeleteDoc docId) =
   [ object ["delete" .= object ["_id" .= docId]]
@@ -582,16 +577,12 @@ generateTrafficTo node stateVar = logOnExit $ do
       let maxPosition = max currentDocCount 10000
       position <- withRng $ randomR (0, maxPosition)
       if position < currentDocCount
-        then do
-          let docId = Seq.index docs position
-          shouldDelete <- (< 0.2) <$> withRng (randomR (0.0, 1.0 :: Double))
-          if shouldDelete
-            then deleteDoc position docId
-            else return $! UpdateDoc docId actionId
-
-        else createDoc actionId
+        then deleteDoc position $ Seq.index docs position
+        else return (CreateDoc actionId)
 
     void $ runExceptT $ callApi node "POST" "/synctest/testdoc/_bulk" $ concatMap encodeAction actions
+
+    atomically $ updateCurrentDocs $ (<>) $ Seq.fromList [ n | CreateDoc n <- actions ]
 
   where
   logOnExit go = go `finally` writeLog node "generateTrafficTo: finished"
