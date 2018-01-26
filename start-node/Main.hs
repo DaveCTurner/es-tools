@@ -525,13 +525,19 @@ main = withCurrentRun $ \currentRun -> do
         writeLog currentRun $ "terminating " ++ nodeName replica
         signalNode replica "TERM"
 
-        threadDelay 20000000
+        threadDelay 2000000
 
-        (master', primary', replica') <- getNodeIdentities
-        writeLog master'  "is now master"
-        writeLog primary' "is now primary"
-        writeLog replica' "is now replica"
+        let getNewNodeIdentities = do
+              (master', primary', replica') <- getNodeIdentities
+              writeLog master'  "is now master"
+              writeLog primary' "is now primary"
+              writeLog replica' "is now replica"
+              when (nodeName master' == nodeName master || nodeName replica' == nodeName replica) $ do
+                writeLog currentRun "retrying: not yet reconfigured"
+                threadDelay 1000000
+                getNewNodeIdentities
 
+        getNewNodeIdentities
         threadDelay 5000000
 
       threadDelay 5000000
