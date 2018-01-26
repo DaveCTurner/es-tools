@@ -106,6 +106,11 @@ withLogFile path go = withFile path AppendMode $ \hLog -> do
   hSetBuffering hLog NoBuffering
   go hLog
 
+logGitVersion :: (String -> IO ()) -> IO ()
+logGitVersion writeLog = do
+  (_, stdout, _) <- readProcessWithExitCode "git" ["rev-parse", "HEAD"] ""
+  writeLog $ "Git revision " ++ filter (>' ') stdout
+
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
@@ -128,6 +133,7 @@ withCurrentRun go = do
     manager <- newManager defaultManagerSettings
 
     writeLogCurrentRun $ "Starting run with working directory: " ++ workingDirectory
+    logGitVersion writeLogCurrentRun
 
     bracket (dockerNetworkCreate writeLogCurrentRun networkName)
             (dockerNetworkRemove writeLogCurrentRun) $ \dockerNetwork -> do
