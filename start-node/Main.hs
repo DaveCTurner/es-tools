@@ -269,7 +269,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:6.1.2"
+             , "docker.elastic.co/elasticsearch/elasticsearch:5.6.6"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
