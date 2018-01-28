@@ -203,7 +203,6 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.security.enabled: false"
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
-  , "xpack.ml.enabled: false"
   , "logger.org.elasticsearch.action.bulk: TRACE"
   , "logger.org.elasticsearch.cluster.service: DEBUG"
   , "logger.org.elasticsearch.indices.recovery: TRACE"
@@ -269,7 +268,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:5.6.6"
+             , "docker.elastic.co/elasticsearch/elasticsearch:5.0.2"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
