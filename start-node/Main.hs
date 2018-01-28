@@ -600,8 +600,11 @@ withTrafficGenerator :: [ElasticsearchNode] -> IO a -> IO a
 withTrafficGenerator allNodes go = do
   rng <- getStdGen
   stateVar <- newTVarIO $ GeneratorState 0 Seq.empty rng
-  let spawnGenerators [] = go
+  let logStart = forM_ allNodes $ \n -> writeLog n "withTrafficGenerator: starting"
+      logEnd   = forM_ allNodes $ \n -> writeLog n "withTrafficGenerator: finished"
+      spawnGenerators [] = go `finally` logEnd
       spawnGenerators (n:ns) = withAsync (generateTrafficTo n stateVar) $ \_ -> spawnGenerators ns
+  logStart
   spawnGenerators $ concat $ replicate 20 allNodes
 
 generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
