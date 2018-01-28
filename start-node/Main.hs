@@ -519,9 +519,6 @@ main = withCurrentRun $ \currentRun -> do
       withTrafficGenerator nodes $ do
         threadDelay 5000000
 
-        writeLog currentRun $ "terminating " ++ nodeName master
-        signalNode master "TERM"
-
         writeLog currentRun $ "terminating " ++ nodeName replica
         signalNode replica "TERM"
 
@@ -532,7 +529,7 @@ main = withCurrentRun $ \currentRun -> do
               writeLog master'  "is now master"
               writeLog primary' "is now primary"
               writeLog replica' "is now replica"
-              when (nodeName master' == nodeName master || nodeName replica' == nodeName replica) $ do
+              when (nodeName replica' == nodeName replica) $ do
                 writeLog currentRun "retrying: not yet reconfigured"
                 threadDelay 1000000
                 getNewNodeIdentities
