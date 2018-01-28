@@ -6,6 +6,7 @@
 
 module Main where
 
+import Data.List (sort)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
@@ -546,15 +547,28 @@ main = withCurrentRun $ \currentRun -> do
       void $ runExceptT $ callApi primary "POST" "/_refresh" []
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
 
-      bailOutOnTimeout 120000000 $ retryOnNodes $ \n -> do
+      let getShardDocCounts n = do
+            shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
+            return [ (nodeId, docCount)
+                   | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
+                   , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
+                   , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Integer
+                   ]
+
+          getDocsOnPrimaryAndReplica maxDocCount = do
+            primaryDocs <- callApi primary "GET" "/synctest/testdoc/_search?preference=_primary" [ object
+                  [ "query" .= object ["match_all" .= object []]
+                  , "size"  .= (1 + maxDocCount)
+                  ]]
+            replicaDocs <- callApi replica "GET" "/synctest/testdoc/_search?preference=_replica" [ object
+                  [ "query" .= object ["match_all" .= object []]
+                  , "size"  .= (1 + maxDocCount)
+                  ]]
+            return (primaryDocs, replicaDocs)
+
+      timeoutResult <- timeout 120000000 $ retryOnNodes $ \n -> do
         void $ callApi n "GET" "/_tasks?detailed" []
-        shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
-        let shardDocCounts =
-              [ (nodeId, docCount)
-              | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
-              , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
-              , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Number
-              ]
+        shardDocCounts <- getShardDocCounts n
         liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
         case shardDocCounts of
           [(nodeId1, docCount1), (nodeId2, docCount2)]
@@ -562,18 +576,27 @@ main = withCurrentRun $ \currentRun -> do
             | otherwise -> do
                 liftIO $ writeLog n "shards have non-matching doc counts"
                 void $ callApi primary "POST" "/_refresh" []
-                void (callApi primary "GET" "/_cat/shards" [])
-                  `catchError` (\_ -> return ())
-                void $ callApi primary "GET" "/synctest/testdoc/_search?preference=_primary" [ object
-                  [ "query" .= object ["match_all" .= object []]
-                  , "size"  .= (1 + max docCount1 docCount2)
-                  ]]
-                void $ callApi replica "GET" "/synctest/testdoc/_search?preference=_replica" [ object
-                  [ "query" .= object ["match_all" .= object []]
-                  , "size"  .= (1 + max docCount1 docCount2)
-                  ]]
+                void (callApi primary "GET" "/_cat/shards" []) `catchError` (\_ -> return ())
+                void $ getDocsOnPrimaryAndReplica (max docCount1 docCount2)
                 throwError $ "found mis-matching doc-counts: " ++ show shardDocCounts
           _ -> throwError $ "did not find doc counts: " ++ show shardDocCounts
+
+      case timeoutResult of
+        Just () -> return ()
+        Nothing -> do
+          writeLog currentRun "timed out waiting for shards to have matching doc counts"
+          bailOutOnTimeout 30000000 $ retryOnNodes $ \n -> do
+            shardDocCounts <- getShardDocCounts n
+            let maxDocCount = maximum $ 0 : map snd shardDocCounts
+            (primaryResult, replicaResult) <- getDocsOnPrimaryAndReplica maxDocCount
+            let docIdsFromResult result = HM.fromList [(docId, ()) | docId <- result ^.. key "hits" . key "hits" . values . key "serial" . _Integer]
+                primaryDocIds = docIdsFromResult primaryResult
+                replicaDocIds = docIdsFromResult replicaResult
+                primaryNotReplica = HM.difference primaryDocIds replicaDocIds
+                replicaNotPrimary = HM.difference replicaDocIds primaryDocIds
+            liftIO $ writeLog n $ "doc ids on primary but not replica: " ++ show (sort [docId | docId <- HM.keys primaryNotReplica])
+            liftIO $ writeLog n $ "doc ids on replica but not primary: " ++ show (sort [docId | docId <- HM.keys replicaNotPrimary])
+          callProcessNoThrow (writeLog currentRun) "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
 
     writeLog currentRun "finished"
 
