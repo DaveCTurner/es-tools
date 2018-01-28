@@ -605,9 +605,7 @@ withTrafficGenerator allNodes go = do
   spawnGenerators $ concat $ replicate 20 allNodes
 
 generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
-generateTrafficTo node stateVar = logOnExit $ do
-  writeLog node "generateTrafficTo: starting"
-  forever $ do
+generateTrafficTo node stateVar = forever $ do
     actions <- replicateM 1000 $ atomically $ do
       actionId <- nextSerial
       docs <- gsCurrentDocs <$> readTVar stateVar
@@ -627,7 +625,6 @@ generateTrafficTo node stateVar = logOnExit $ do
     void $ runExceptT $ callApi node "POST" "/synctest/testdoc/_bulk" $ concatMap encodeAction actions
 
   where
-  logOnExit go = go `finally` writeLog node "generateTrafficTo: finished"
 
   nextSerial :: STM Int
   nextSerial = do
