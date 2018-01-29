@@ -596,7 +596,9 @@ main = join $ withCurrentRun $ \currentRun -> do
                 replicaNotPrimary = HM.difference replicaDocIds primaryDocIds
             liftIO $ writeLog n $ "doc ids on primary but not replica: " ++ show (sort [docId | docId <- HM.keys primaryNotReplica])
             liftIO $ writeLog n $ "doc ids on replica but not primary: " ++ show (sort [docId | docId <- HM.keys replicaNotPrimary])
-          return (callProcessNoThrow putStrLn "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"])
+          return $ do
+            callProcessNoThrow putStrLn "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
+            exitWith (ExitFailure 1)
 
 data GeneratorState = GeneratorState
   { gsNextSerial  :: Int
