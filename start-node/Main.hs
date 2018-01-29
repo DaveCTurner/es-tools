@@ -589,7 +589,7 @@ main = join $ withCurrentRun $ \currentRun -> do
             shardDocCounts <- getShardDocCounts n
             let maxDocCount = maximum $ 0 : map snd shardDocCounts
             (primaryResult, replicaResult) <- getDocsOnPrimaryAndReplica maxDocCount
-            let docIdsFromResult result = HM.fromList [(docId, ()) | docId <- result ^.. key "hits" . key "hits" . values . key "serial" . _Integer]
+            let docIdsFromResult result = HM.fromList [(docId, ()) | docId <- result ^.. key "hits" . key "hits" . values . key "_source" . key "serial" . _Integer]
                 primaryDocIds = docIdsFromResult primaryResult
                 replicaDocIds = docIdsFromResult replicaResult
                 primaryNotReplica = HM.difference primaryDocIds replicaDocIds
