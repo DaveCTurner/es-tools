@@ -370,29 +370,31 @@ callApi node verb path reqBody = do
 bothWays :: Applicative m => (ElasticsearchNode -> ElasticsearchNode -> m ()) -> ElasticsearchNode -> ElasticsearchNode -> m ()
 bothWays go n1 n2 = (<>) <$> go n1 n2 <*> go n2 n1
 
+runIptables :: [String] -> String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
+runIptables args action n1 n2 = 
+  callProcess "sudo" $ [ "iptables", action, "DOCKER-USER"
+                       , "--source",      ncBindHost (esnConfig n1)
+                       , "--destination", ncBindHost (esnConfig n2)
+                       , "--protocol", "tcp"
+                       ] ++ args
+
+iptablesReject :: String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
+iptablesReject = runIptables ["--jump", "REJECT", "--reject-with", "tcp-reset"]
+
+iptablesDrop :: String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
+iptablesDrop = runIptables ["--jump", "DROP"]
+
 breakLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
-breakLink = bothWays breakDirectedLink
+breakLink = bothWays $ iptablesReject "-I"
 
-breakDirectedLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
-breakDirectedLink n1 n2 = do
-  callProcess "sudo" [ "iptables", "-I", "DOCKER-USER"
-                     , "--source",      ncBindHost (esnConfig n1)
-                     , "--destination", ncBindHost (esnConfig n2)
-                     , "--protocol", "tcp"
-                     , "--jump", "REJECT", "--reject-with", "tcp-reset"
-                     ]
+unbreakLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+unbreakLink = bothWays $ iptablesReject "-D"
 
-restoreLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
-restoreLink = bothWays restoreDirectedLink
+pauseLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+pauseLink = bothWays $ iptablesDrop "-I"
 
-restoreDirectedLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
-restoreDirectedLink n1 n2 = do
-  callProcess "sudo" [ "iptables", "-D", "DOCKER-USER"
-                     , "--source",      ncBindHost (esnConfig n1)
-                     , "--destination", ncBindHost (esnConfig n2)
-                     , "--protocol", "tcp"
-                     , "--jump", "REJECT", "--reject-with", "tcp-reset"
-                     ]
+unpauseLink :: ElasticsearchNode -> ElasticsearchNode -> IO ()
+unpauseLink = bothWays $ iptablesDrop "-D"
 
 main :: IO ()
 main = join $ withCurrentRun $ \currentRun -> do
@@ -516,23 +518,28 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
+      let [otherDataNode] = [n | n <- nodes, ncIsDataNode (esnConfig n), not (nodeName n `elem` map nodeName [primary, replica])]
+
       withTrafficGenerator nodes $ do
         threadDelay 5000000
 
-        writeLog currentRun $ "terminating " ++ nodeName master
-        signalNode master "TERM"
+        writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName otherDataNode
+        pauseLink primary otherDataNode
 
         writeLog currentRun $ "terminating " ++ nodeName replica
         signalNode replica "TERM"
 
-        threadDelay 2000000
+        threadDelay 10000000
+
+        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName otherDataNode
+        unpauseLink primary otherDataNode
 
         let getNewNodeIdentities = do
               (master', primary', replica') <- getNodeIdentities
               writeLog master'  "is now master"
               writeLog primary' "is now primary"
               writeLog replica' "is now replica"
-              when (nodeName master' == nodeName master || nodeName replica' == nodeName replica) $ do
+              when (nodeName replica' == nodeName replica) $ do
                 writeLog currentRun "retrying: not yet reconfigured"
                 threadDelay 1000000
                 getNewNodeIdentities
