@@ -529,7 +529,7 @@ main = join $ withCurrentRun $ \currentRun -> do
         writeLog currentRun $ "terminating " ++ nodeName replica
         signalNode replica "TERM"
 
-        threadDelay 10000000
+        threadDelay 20000000
 
         writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName otherDataNode
         unpauseLink primary otherDataNode
