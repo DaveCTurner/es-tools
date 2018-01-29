@@ -462,16 +462,11 @@ main = join $ withCurrentRun $ \currentRun -> do
             [ "index" .= object
               [ "number_of_shards"   .= Number 1
               , "number_of_replicas" .= Number 1
-              , "unassigned.node_left.delayed_timeout" .= String "5s"
-              , "max_result_window" .= Number 1000000
               ]
             ]
           , "mappings" .= object
             [ "testdoc" .= object
-              [ "properties" .= object
-                [ "serial"  .= object [ "type" .= String "long" ]
-                , "updated" .= object [ "type" .= String "long" ]
-                ]
+              [ "properties" .= object []
               ]
             ]
           ]
@@ -518,39 +513,20 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      let [otherDataNode] = [n | n <- nodes, ncIsDataNode (esnConfig n), not (nodeName n `elem` map nodeName [primary, replica])]
+      writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
+      pauseLink primary replica
 
-      withTrafficGenerator nodes $ do
-        threadDelay 5000000
+      writeLog currentRun $ "deleting doc"
+      void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
 
-        writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName otherDataNode
-        pauseLink primary otherDataNode
+      threadDelay 10000000
+      writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
+      unpauseLink primary replica
 
-        writeLog currentRun $ "terminating " ++ nodeName replica
-        signalNode replica "TERM"
+      threadDelay 51000000
+      writeLog currentRun $ "indexing doc"
+      void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
 
-        threadDelay 20000000
-
-        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName otherDataNode
-        unpauseLink primary otherDataNode
-
-        let getNewNodeIdentities = do
-              (master', primary', replica') <- getNodeIdentities
-              writeLog master'  "is now master"
-              writeLog primary' "is now primary"
-              writeLog replica' "is now replica"
-              when (nodeName replica' == nodeName replica) $ do
-                writeLog currentRun "retrying: not yet reconfigured"
-                threadDelay 1000000
-                getNewNodeIdentities
-
-        getNewNodeIdentities
-        threadDelay 5000000
-
-      threadDelay 5000000
-
-    do
-      (master, primary, replica) <- getNodeIdentities
       void $ runExceptT $ callApi primary "POST" "/_refresh" []
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
 
