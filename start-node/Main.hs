@@ -395,7 +395,7 @@ restoreDirectedLink n1 n2 = do
                      ]
 
 main :: IO ()
-main = withCurrentRun $ \currentRun -> do
+main = join $ withCurrentRun $ \currentRun -> do
 
   javaHome <- lookupEnv "JAVA_HOME"
 
@@ -582,7 +582,7 @@ main = withCurrentRun $ \currentRun -> do
           _ -> throwError $ "did not find doc counts: " ++ show shardDocCounts
 
       case timeoutResult of
-        Just () -> return ()
+        Just () -> return (return ())
         Nothing -> do
           writeLog currentRun "timed out waiting for shards to have matching doc counts"
           bailOutOnTimeout 30000000 $ retryOnNodes $ \n -> do
@@ -596,9 +596,7 @@ main = withCurrentRun $ \currentRun -> do
                 replicaNotPrimary = HM.difference replicaDocIds primaryDocIds
             liftIO $ writeLog n $ "doc ids on primary but not replica: " ++ show (sort [docId | docId <- HM.keys primaryNotReplica])
             liftIO $ writeLog n $ "doc ids on replica but not primary: " ++ show (sort [docId | docId <- HM.keys replicaNotPrimary])
-          callProcessNoThrow (writeLog currentRun) "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
-
-    writeLog currentRun "finished"
+          return (callProcessNoThrow putStrLn "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"])
 
 data GeneratorState = GeneratorState
   { gsNextSerial  :: Int
