@@ -517,12 +517,15 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
       pauseLink primary replica
 
-      writeLog currentRun $ "deleting doc"
-      void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
+      let deleteDoc = do
+            writeLog currentRun $ "deleting doc"
+            void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
 
-      threadDelay 1000000
-      writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
-      unpauseLink primary replica
+      withAsync deleteDoc $ \deleteDocAsync -> do
+        threadDelay 1000000
+        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
+        unpauseLink primary replica
+        wait deleteDocAsync
 
       threadDelay 59500000
       writeLog currentRun $ "indexing doc"
