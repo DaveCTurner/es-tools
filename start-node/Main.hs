@@ -522,7 +522,7 @@ main = join $ withCurrentRun $ \currentRun -> do
             void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
 
       withAsync indexDoc $ \asyncIndexing -> do
-        threadDelay 3100000
+        threadDelay 1000000
         writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
         unpauseLink primary replica
 
