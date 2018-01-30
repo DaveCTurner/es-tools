@@ -270,7 +270,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:5.6.6"
+             , "docker.elastic.co/elasticsearch/elasticsearch:6.1.2"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
@@ -519,7 +519,7 @@ main = join $ withCurrentRun $ \currentRun -> do
 
       let indexDoc = do
             writeLog currentRun $ "indexing doc"
-            void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
+            void $ runExceptT $ callApi primary "POST" "/synctest/testdoc?refresh=true" [object[]]
 
       withAsync indexDoc $ \asyncIndexing -> do
         threadDelay 1000000
