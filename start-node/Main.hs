@@ -517,20 +517,16 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
       pauseLink primary replica
 
-      let indexDoc = do
-            writeLog currentRun $ "indexing doc"
-            void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
+      writeLog currentRun $ "deleting doc"
+      void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
 
-      withAsync indexDoc $ \asyncIndexing -> do
-        threadDelay 1000000
-        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
-        unpauseLink primary replica
+      threadDelay 10000000
+      writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
+      unpauseLink primary replica
 
-        writeLog currentRun $ "deleting docs"
-        void $ runExceptT $ callApi primary "POST" "/synctest/_delete_by_query"
-          [ object[ "query" .= object [ "match_all" .= object[]]]]
-
-        wait asyncIndexing
+      threadDelay 51000000
+      writeLog currentRun $ "indexing doc"
+      void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
 
       void $ runExceptT $ callApi primary "POST" "/_refresh" []
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
