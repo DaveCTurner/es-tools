@@ -204,6 +204,7 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.security.enabled: false"
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
+  , "xpack.ml.enabled: false"
   , "logger.org.elasticsearch.action.bulk: TRACE"
   , "logger.org.elasticsearch.cluster.service: DEBUG"
   , "logger.org.elasticsearch.indices.recovery: TRACE"
@@ -269,7 +270,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:5.0.2"
+             , "docker.elastic.co/elasticsearch/elasticsearch:5.4.3"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
@@ -516,16 +517,20 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
       pauseLink primary replica
 
-      writeLog currentRun $ "deleting doc"
-      void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
+      let indexDoc = do
+            writeLog currentRun $ "indexing doc"
+            void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
 
-      threadDelay 10000000
-      writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
-      unpauseLink primary replica
+      withAsync indexDoc $ \asyncIndexing -> do
+        threadDelay 3100000
+        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
+        unpauseLink primary replica
 
-      threadDelay 51000000
-      writeLog currentRun $ "indexing doc"
-      void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
+        writeLog currentRun $ "deleting docs"
+        void $ runExceptT $ callApi primary "POST" "/synctest/_delete_by_query"
+          [ object[ "query" .= object [ "match_all" .= object[]]]]
+
+        wait asyncIndexing
 
       void $ runExceptT $ callApi primary "POST" "/_refresh" []
       void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
