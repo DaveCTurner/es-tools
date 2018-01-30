@@ -520,11 +520,11 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog currentRun $ "deleting doc"
       void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid" []
 
-      threadDelay 10000000
+      threadDelay 1000000
       writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
       unpauseLink primary replica
 
-      threadDelay 51000000
+      threadDelay 59500000
       writeLog currentRun $ "indexing doc"
       void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
 
