@@ -60,7 +60,7 @@ data CurrentRun = CurrentRun
   , crWorkingDirectory :: FilePath
   , crWriteLog         :: String -> IO ()
   , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
-  , crManager          :: Manager
+  , crHttpManager      :: Manager
   , crDockerNetwork    :: DockerNetwork
   }
 
@@ -154,7 +154,7 @@ withCurrentRun go = do
         , crWorkingDirectory = workingDirectory
         , crWriteLog         = writeLogCurrentRun
         , crWriteApiLog      = writeApiLog
-        , crManager          = manager
+        , crHttpManager      = manager
         , crDockerNetwork    = dockerNetwork
         }
 
@@ -355,7 +355,7 @@ callApi node verb path reqBody = do
                               ++ [(hContentType, "application/x-ndjson") | length reqBody >  1]
         , requestBody    = RequestBodyLBS reqBodyBytes
         }
-      manager = crManager $ ncCurrentRun $ esnConfig node
+      manager = crHttpManager $ ncCurrentRun $ esnConfig node
 
       go = withResponse req manager $ \response -> do
         fullResponse <- BL.fromChunks <$> brConsume (responseBody response)
