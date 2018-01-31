@@ -8,6 +8,9 @@ module Main where
 
 import LogFile
 import LogContext
+import CurrentRun
+import DockerNetwork
+import Process
 
 import Data.List (sort)
 import Control.Concurrent (threadDelay)
@@ -52,51 +55,6 @@ terminateStreamingProcess = terminateProcess . streamingProcessHandleRaw
 mkEnv :: [(String, Maybe String)] -> Maybe [(String, String)]
 mkEnv = Just . mapMaybe (\(k, mv) -> fmap (k,) mv)
 
-data CurrentRun = CurrentRun
-  { crName             :: String
-  , crWorkingDirectory :: FilePath
-  , crWriteLog         :: String -> IO ()
-  , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
-  , crHttpManager      :: Manager
-  , crDockerNetwork    :: DockerNetwork
-  }
-
-instance LogContext CurrentRun where
-  writeLog = crWriteLog
-
-newtype DockerNetwork = DockerNetwork { _unDockerNetwork :: String }
-  deriving (Show, Eq)
-
-dockerNetworkCreate :: LogContext a => a -> String -> IO DockerNetwork
-dockerNetworkCreate logContext networkName = DockerNetwork <$> do
-
-  let args = ["network", "create", "--driver=bridge", "--subnet=10.10.10.0/24", "--ip-range=10.10.10.0/24"
-             ,"--opt", "com.docker.network.bridge.name=" ++ networkName, networkName]
-
-  writeLog logContext $ "dockerNetworkCreate: running docker " ++ unwords args
-
-  (ec, stdoutContent, stderrContent) <- readProcessWithExitCode "docker" args ""
-
-  if null stderrContent && ec == ExitSuccess
-    then return $ filter (> ' ') stdoutContent
-    else do
-      writeLog logContext $ "dockerNetworkCreate: docker " ++ unwords args ++ " exited with " ++ show ec ++ " yielding '" ++ stderrContent ++ "'"
-      error "docker network create failed"
-
-callProcessNoThrow :: LogContext a => a -> FilePath -> [String] -> IO ()
-callProcessNoThrow logContext exe args = do
-  let description = unwords $ exe : args
-  writeLog logContext $ "callProcessNoThrow: running " ++ description
-  (ec, _, _) <- readProcessWithExitCode exe args ""
-  case ec of
-    ExitSuccess   -> return ()
-    ExitFailure c -> writeLog logContext $ printf "callProcessNoThrow: %s exited with code %d" description c
-
-dockerNetworkRemove :: LogContext a => a -> DockerNetwork-> IO ()
-dockerNetworkRemove logContext dockerNetwork = do
-  threadDelay 1000000
-  callProcessNoThrow logContext "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
-
 logGitVersion :: LogContext a => a -> IO ()
 logGitVersion logContext = do
   (_, result, _) <- readProcessWithExitCode "git" ["rev-parse", "HEAD"] ""
@@ -107,20 +65,16 @@ withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
-      networkName = "elasticnet"
-
   createElasticDirectory putStrLn workingDirectory
 
   withConcurrentLogFile (workingDirectory </> "run.log") $ \runLog ->
     withConcurrentLogFile (workingDirectory </> "api.log") $ \apiLog -> do
 
-    let writeLogCurrentRun msg = withLogHandle runLog $ \h -> do
+    let logContext = NoContext $ \msg -> withLogHandle runLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
           let fullMsg = "[" ++ now ++ "] " ++ msg
           putStrLn fullMsg
           hPutStrLn h fullMsg
-
-        logContext = NoContext writeLogCurrentRun
 
         writeApiLog method url request response = withLogHandle apiLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
@@ -129,22 +83,17 @@ withCurrentRun go = do
 
     manager <- newManager defaultManagerSettings
 
-    writeLogCurrentRun $ "Starting run with working directory: " ++ workingDirectory
-    logGitVersion (NoContext writeLogCurrentRun)
+    writeLog logContext $ "Starting run with working directory: " ++ workingDirectory
+    logGitVersion logContext
 
-    bracket (dockerNetworkCreate logContext networkName)
-            (dockerNetworkRemove logContext) $ \dockerNetwork -> do
-
-      writeLogCurrentRun $ "Using docker network " ++ show dockerNetwork
-
-      go CurrentRun
-        { crName             = runName
-        , crWorkingDirectory = workingDirectory
-        , crWriteLog         = writeLogCurrentRun
-        , crWriteApiLog      = writeApiLog
-        , crHttpManager      = manager
-        , crDockerNetwork    = dockerNetwork
-        }
+    withDockerNetwork logContext $ \dockerNetwork -> go CurrentRun
+      { crName             = runName
+      , crWorkingDirectory = workingDirectory
+      , crWriteLog         = writeLog logContext
+      , crWriteApiLog      = writeApiLog
+      , crHttpManager      = manager
+      , crDockerNetwork    = dockerNetwork
+      }
 
 data NodeConfig = NodeConfig
   { ncCurrentRun           :: CurrentRun
@@ -241,7 +190,7 @@ data ElasticsearchNode = ElasticsearchNode
   , esnThread    :: Async ExitCode
   }
 
-instance LogContext      ElasticsearchNode where writeLog = writeLog . esnConfig
+instance LogContext  ElasticsearchNode where writeLog = writeLog . esnConfig
 instance HasNodeName ElasticsearchNode where nodeName = nodeName . esnConfig
 
 runNode :: NodeConfig -> IO ElasticsearchNode
@@ -256,7 +205,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "data" ++ ",target=/usr/share/elasticsearch/data"
              , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "logs" ++ ",target=/usr/share/elasticsearch/logs"
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
-             , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
+             , "--network", dockerNetworkId $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
              , "docker.elastic.co/elasticsearch/elasticsearch:6.1.2"
              ]
