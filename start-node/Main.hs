@@ -108,6 +108,19 @@ withLogFile path go = withFile path AppendMode $ \hLog -> do
   hSetBuffering hLog NoBuffering
   go hLog
 
+data LogFile = LogFile (MVar Handle)
+
+withConcurrentLogFile :: FilePath -> (LogFile -> IO a) -> IO a
+withConcurrentLogFile path go = withFile path AppendMode $ \hLog -> do
+  lock <- newMVar hLog
+  go $ LogFile lock
+
+withLogHandle :: LogFile -> (Handle -> IO a) -> IO a
+withLogHandle (LogFile handleVar) go = withMVar handleVar $ \h -> do
+  a <- go h
+  hFlush h
+  return a
+
 logGitVersion :: (String -> IO ()) -> IO ()
 logGitVersion writeLog = do
   (_, stdout, _) <- readProcessWithExitCode "git" ["rev-parse", "HEAD"] ""
@@ -122,22 +135,19 @@ withCurrentRun go = do
 
   createElasticDirectory putStrLn workingDirectory
 
-  withLogFile (workingDirectory </> "run.log") $ \hLog ->
-    withLogFile (workingDirectory </> "api.log") $ \hApiLog -> do
-    logLock <- newMVar ()
-    apiLogLock <- newMVar ()
+  withConcurrentLogFile (workingDirectory </> "run.log") $ \runLog ->
+    withConcurrentLogFile (workingDirectory </> "api.log") $ \apiLog -> do
 
-    let writeLogCurrentRun msg = withMVar logLock $ \() -> do
+    let writeLogCurrentRun msg = withLogHandle runLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
           let fullMsg = "[" ++ now ++ "] " ++ msg
           putStrLn fullMsg
-          hPutStrLn hLog fullMsg
-          hFlush hLog
+          hPutStrLn h fullMsg
 
-        writeApiLog method url request response = withMVar apiLogLock $ \() -> do
+        writeApiLog method url request response = withLogHandle apiLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
-          hPutStrLn hApiLog $ printf "[%s] %s %s" now (show method) url
-          BL.hPut hApiLog $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
+          hPutStrLn h $ printf "[%s] %s %s" now (show method) url
+          BL.hPut h $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
 
     manager <- newManager defaultManagerSettings
 
