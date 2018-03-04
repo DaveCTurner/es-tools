@@ -6,26 +6,28 @@
 
 module Main where
 
+import LogFile
+import LogContext
+import CurrentRun
+import DockerNetwork
+import Process
+
 import Data.List (sort)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
-import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens hiding ((.=))
 import Control.Monad
 import Control.Monad.Except
-import Control.Monad.IO.Class
 import Control.Monad.Trans.Resource
 import Data.Aeson
 import Data.Aeson.Lens
 import Data.Conduit
 import Data.Conduit.Binary hiding (mapM_, take, head)
 import Data.Conduit.Process
-import Data.Hashable
 import Data.Maybe
 import Data.Monoid
-import Data.Streaming.Process
 import Data.Time
 import Data.Time.ISO8601
 import Network.HTTP.Client
@@ -35,8 +37,6 @@ import System.Environment
 import System.Exit
 import System.FilePath
 import System.IO
-import System.Posix.Signals
-import System.Process
 import System.Process.Internals
 import System.Random
 import System.Timeout
@@ -55,108 +55,45 @@ terminateStreamingProcess = terminateProcess . streamingProcessHandleRaw
 mkEnv :: [(String, Maybe String)] -> Maybe [(String, String)]
 mkEnv = Just . mapMaybe (\(k, mv) -> fmap (k,) mv)
 
-data CurrentRun = CurrentRun
-  { crName             :: String
-  , crWorkingDirectory :: FilePath
-  , crWriteLog         :: String -> IO ()
-  , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
-  , crManager          :: Manager
-  , crDockerNetwork    :: DockerNetwork
-  }
-
-class CanLog a where
-  writeLog :: a -> String -> IO ()
-
-instance CanLog CurrentRun where
-  writeLog = crWriteLog
-
-newtype DockerNetwork = DockerNetwork { _unDockerNetwork :: String }
-  deriving (Show, Eq)
-
-dockerNetworkCreate :: (String -> IO ()) -> String -> IO DockerNetwork
-dockerNetworkCreate writeLog networkName = DockerNetwork <$> do
-
-  let args = ["network", "create", "--driver=bridge", "--subnet=10.10.10.0/24", "--ip-range=10.10.10.0/24"
-             ,"--opt", "com.docker.network.bridge.name=" ++ networkName, networkName]
-
-  writeLog $ "dockerNetworkCreate: running docker " ++ unwords args
-
-  (ec, stdout, stderr) <- readProcessWithExitCode "docker" args ""
-
-  if null stderr && ec == ExitSuccess
-    then return $ filter (> ' ') stdout
-    else do
-      writeLog $ "dockerNetworkCreate: docker " ++ unwords args ++ " exited with " ++ show ec ++ " yielding '" ++ stderr ++ "'"
-      error "docker network create failed"
-
-callProcessNoThrow :: (String -> IO ()) -> FilePath -> [String] -> IO ()
-callProcessNoThrow writeLog exe args = do
-  let description = unwords $ exe : args
-  writeLog $ "callProcessNoThrow: running " ++ description
-  (ec, _, _) <- readProcessWithExitCode exe args ""
-  case ec of
-    ExitSuccess   -> return ()
-    ExitFailure c -> writeLog $ printf "callProcessNoThrow: %s exited with code %d" description c
-
-dockerNetworkRemove :: (String -> IO ()) -> DockerNetwork-> IO ()
-dockerNetworkRemove writeLog dockerNetwork = do
-  threadDelay 1000000
-  callProcessNoThrow writeLog "docker" [ "network", "rm", _unDockerNetwork dockerNetwork ]
-
-withLogFile :: FilePath -> (Handle -> IO a) -> IO a
-withLogFile path go = withFile path AppendMode $ \hLog -> do
-  hSetBuffering hLog NoBuffering
-  go hLog
-
-logGitVersion :: (String -> IO ()) -> IO ()
-logGitVersion writeLog = do
-  (_, stdout, _) <- readProcessWithExitCode "git" ["rev-parse", "HEAD"] ""
-  writeLog $ "Git revision " ++ filter (>' ') stdout
+logGitVersion :: LogContext a => a -> IO ()
+logGitVersion logContext = do
+  (_, result, _) <- readProcessWithExitCode "git" ["rev-parse", "HEAD"] ""
+  writeLog logContext $ "Git revision " ++ filter (>' ') result
 
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
   runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
-      networkName = "elasticnet"
-
   createElasticDirectory putStrLn workingDirectory
 
-  withLogFile (workingDirectory </> "run.log") $ \hLog ->
-    withLogFile (workingDirectory </> "api.log") $ \hApiLog -> do
-    logLock <- newMVar ()
-    apiLogLock <- newMVar ()
+  withConcurrentLogFile (workingDirectory </> "run.log") $ \runLog ->
+    withConcurrentLogFile (workingDirectory </> "api.log") $ \apiLog -> do
 
-    let writeLogCurrentRun msg = withMVar logLock $ \() -> do
+    let logContext = NoContext $ \msg -> withLogHandle runLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
           let fullMsg = "[" ++ now ++ "] " ++ msg
           putStrLn fullMsg
-          hPutStrLn hLog fullMsg
-          hFlush hLog
+          hPutStrLn h fullMsg
 
-        writeApiLog method url request response = withMVar apiLogLock $ \() -> do
+        writeApiLog method url request response = withLogHandle apiLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
-          hPutStrLn hApiLog $ printf "[%s] %s %s" now (show method) url
-          BL.hPut hApiLog $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
+          hPutStrLn h $ printf "[%s] %s %s" now (show method) url
+          BL.hPut h $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
 
     manager <- newManager defaultManagerSettings
 
-    writeLogCurrentRun $ "Starting run with working directory: " ++ workingDirectory
-    logGitVersion writeLogCurrentRun
+    writeLog logContext $ "Starting run with working directory: " ++ workingDirectory
+    logGitVersion logContext
 
-    bracket (dockerNetworkCreate writeLogCurrentRun networkName)
-            (dockerNetworkRemove writeLogCurrentRun) $ \dockerNetwork -> do
-
-      writeLogCurrentRun $ "Using docker network " ++ show dockerNetwork
-
-      go CurrentRun
-        { crName             = runName
-        , crWorkingDirectory = workingDirectory
-        , crWriteLog         = writeLogCurrentRun
-        , crWriteApiLog      = writeApiLog
-        , crManager          = manager
-        , crDockerNetwork    = dockerNetwork
-        }
+    withDockerNetwork logContext $ \dockerNetwork -> go CurrentRun
+      { crName             = runName
+      , crWorkingDirectory = workingDirectory
+      , crWriteLog         = writeLog logContext
+      , crWriteApiLog      = writeApiLog
+      , crHttpManager      = manager
+      , crDockerNetwork    = dockerNetwork
+      }
 
 data NodeConfig = NodeConfig
   { ncCurrentRun           :: CurrentRun
@@ -170,7 +107,7 @@ data NodeConfig = NodeConfig
   , ncUnicastHosts         :: [String]
   }
 
-instance CanLog NodeConfig where
+instance LogContext NodeConfig where
   writeLog nc = writeLog (ncCurrentRun nc) . printf "[%-9s] %s" (ncName nc)
 
 class HasNodeName a where nodeName :: a -> String
@@ -215,10 +152,10 @@ yieldString :: Monad m => String -> Producer m B.ByteString
 yieldString = yield . T.encodeUtf8 . T.pack . (++ "\n")
 
 createElasticDirectory :: (String -> IO ()) -> FilePath -> IO ()
-createElasticDirectory writeLog path = do
+createElasticDirectory writeLogEntry path = do
   createDirectoryIfMissing True path
   let args = ["chown", "elastic:elastic", path]
-  writeLog $ "createElasticDirectory: sudo " ++ unwords args
+  writeLogEntry $ "createElasticDirectory: sudo " ++ unwords args
   callProcess "sudo" args
 
 makeConfig :: NodeConfig -> IO ()
@@ -253,7 +190,7 @@ data ElasticsearchNode = ElasticsearchNode
   , esnThread    :: Async ExitCode
   }
 
-instance CanLog      ElasticsearchNode where writeLog = writeLog . esnConfig
+instance LogContext  ElasticsearchNode where writeLog = writeLog . esnConfig
 instance HasNodeName ElasticsearchNode where nodeName = nodeName . esnConfig
 
 runNode :: NodeConfig -> IO ElasticsearchNode
@@ -268,7 +205,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "data" ++ ",target=/usr/share/elasticsearch/data"
              , "--mount", "type=bind,source=" ++ nodeWorkingDirectory nodeConfig </> "logs" ++ ",target=/usr/share/elasticsearch/logs"
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
-             , "--network", _unDockerNetwork $ crDockerNetwork $ ncCurrentRun nodeConfig
+             , "--network", dockerNetworkId $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
              , "docker.elastic.co/elasticsearch/elasticsearch:6.1.2"
              ]
@@ -323,8 +260,8 @@ runNode nodeConfig = do
     }
 
 signalNode :: ElasticsearchNode -> String -> IO ()
-signalNode n@ElasticsearchNode{..} signal =
-  callProcessNoThrow (writeLog n) "docker" ["kill", "--signal", signal, nodeName n]
+signalNode n signal =
+  callProcessNoThrow n "docker" ["kill", "--signal", signal, nodeName n]
 
 awaitStarted :: ElasticsearchNode -> STM Bool
 awaitStarted ElasticsearchNode{..} = saidStarted `orElse` threadExited
@@ -355,7 +292,7 @@ callApi node verb path reqBody = do
                               ++ [(hContentType, "application/x-ndjson") | length reqBody >  1]
         , requestBody    = RequestBodyLBS reqBodyBytes
         }
-      manager = crManager $ ncCurrentRun $ esnConfig node
+      manager = crHttpManager $ ncCurrentRun $ esnConfig node
 
       go = withResponse req manager $ \response -> do
         fullResponse <- BL.fromChunks <$> brConsume (responseBody response)
@@ -416,7 +353,7 @@ main = join $ withCurrentRun $ \currentRun -> do
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
             }
-          | nodeIndex <- [1..6]
+          | nodeIndex <- [1..6] :: [Int]
           , let isMaster = nodeIndex <= 3
           ]
 
@@ -431,8 +368,6 @@ main = join $ withCurrentRun $ \currentRun -> do
       bailOut msg = do
         writeLog currentRun msg
         error msg
-
-      bailOutOnError go = either bailOut return =<< runExceptT go
 
       bailOutOnTimeout t go = maybe (bailOut "bailOutOnTimeout: timed out") return =<< timeout t go
 
@@ -486,8 +421,8 @@ main = join $ withCurrentRun $ \currentRun -> do
           let nodesFromIds nodeIds =
                 [ node
                 | nodeId <- nodeIds
-                , nodeName <- state ^.. key "nodes" . key nodeId . key "name" . _String . to T.unpack
-                , Just node <- [HM.lookup nodeName nodesByName]
+                , nodeNameStr <- state ^.. key "nodes" . key nodeId . key "name" . _String . to T.unpack
+                , Just node <- [HM.lookup nodeNameStr nodesByName]
                 ]
 
               getUniqueNode nodeType = \case
@@ -503,8 +438,8 @@ main = join $ withCurrentRun $ \currentRun -> do
                 , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
                 ]
 
-          primaryNode <- getUniqueNode "primary" $ nodesFromIds [n | (n, True)  <- shardCopyNodeIds]
-          replicaNode <- getUniqueNode "replica" $ nodesFromIds [n | (n, False) <- shardCopyNodeIds]
+          primaryNode <- getUniqueNode "primary" $ nodesFromIds [nid | (nid, True)  <- shardCopyNodeIds]
+          replicaNode <- getUniqueNode "replica" $ nodesFromIds [nid | (nid, False) <- shardCopyNodeIds]
 
           return (masterNode, primaryNode, replicaNode)
 
@@ -558,7 +493,7 @@ main = join $ withCurrentRun $ \currentRun -> do
         shardDocCounts <- getShardDocCounts n
         liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
         case shardDocCounts of
-          [(nodeId1, docCount1), (nodeId2, docCount2)]
+          [(_, docCount1), (_, docCount2)]
             | docCount1 == docCount2 -> liftIO $ writeLog n "shards have matching doc counts"
             | otherwise -> do
                 liftIO $ writeLog n "shards have non-matching doc counts"
@@ -584,7 +519,7 @@ main = join $ withCurrentRun $ \currentRun -> do
             liftIO $ writeLog n $ "doc ids on primary but not replica: " ++ show (sort [docId | docId <- HM.keys primaryNotReplica])
             liftIO $ writeLog n $ "doc ids on replica but not primary: " ++ show (sort [docId | docId <- HM.keys replicaNotPrimary])
           return $ do
-            callProcessNoThrow putStrLn "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
+            callProcessNoThrow (NoContext putStrLn) "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
             exitWith (ExitFailure 1)
 
 data GeneratorState = GeneratorState
