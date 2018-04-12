@@ -12,7 +12,6 @@ import CurrentRun
 import DockerNetwork
 import Process
 
-import Data.List (sort)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.STM
@@ -353,7 +352,7 @@ main = join $ withCurrentRun $ \currentRun -> do
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
             }
-          | nodeIndex <- [1..6] :: [Int]
+          | nodeIndex <- [1..5] :: [Int]
           , let isMaster = nodeIndex <= 3
           ]
 
@@ -449,78 +448,55 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
-      pauseLink primary replica
+      let masterBackups@[masterBackup1, masterBackup2] = [ n | n <- nodes, ncIsMasterEligibleNode (esnConfig n), ncName (esnConfig n) /= ncName (esnConfig master) ]
+      writeLog masterBackup1 "is master backup"
+      writeLog masterBackup2 "is master backup"
 
-      let deleteDoc = do
-            writeLog currentRun $ "deleting doc"
-            void $ runExceptT $ callApi primary "DELETE" "/synctest/testdoc/testid?refresh=true" []
+      writeLog currentRun $ "breaking link between " ++ nodeName primary ++ " and " ++ nodeName replica
+      breakLink primary replica
 
-      withAsync deleteDoc $ \deleteDocAsync -> do
+      writeLog currentRun $ "pausing link between " ++ nodeName master ++ " and " ++ nodeName replica
+      pauseLink master replica
+
+      forM_ masterBackups $ \mb -> do
+        writeLog currentRun $ "pausing link between " ++ nodeName master ++ " and " ++ nodeName mb
+        pauseLink master mb
+        writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName mb
+        pauseLink primary mb
+
+      let indexDoc = do
+            threadDelay 1000000
+            writeLog primary "indexing document"
+            void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
+            writeLog primary "indexing document finished"
+
+      withAsync indexDoc $ \indexDocAsync -> do
+        threadDelay 500000
+        iptablesDrop "-D" master masterBackup1
         threadDelay 1000000
-        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName replica
-        unpauseLink primary replica
-        wait deleteDocAsync
+        iptablesDrop "-I" master masterBackup1
+        threadDelay 500000
+        iptablesDrop "-D" masterBackup1 master
+        threadDelay 1000000
+        iptablesDrop "-I" masterBackup1 master
 
-      threadDelay 59500000
-      writeLog currentRun $ "indexing doc"
-      void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
+        wait indexDocAsync
 
-      void $ runExceptT $ callApi primary "POST" "/_refresh" []
-      void $ runExceptT $ callApi primary "POST" "/_flush/synced" []
+      threadDelay 100000000
 
-      let getShardDocCounts n = do
-            shardStatsResult <- callApi n "GET" "/synctest/_stats?level=shards" []
-            return [ (nodeId, docCount)
-                   | shardCopyStats <- shardStatsResult ^.. key "indices" . key "synctest" . key "shards" . key "0" . values
-                   , nodeId   <- shardCopyStats ^.. key "routing" . key "node"    . _String
-                   , docCount <- shardCopyStats ^.. key "docs"    . key "count"   . _Integer
-                   ]
+      writeLog currentRun $ "unbreaking link between " ++ nodeName primary ++ " and " ++ nodeName replica
+      unbreakLink primary replica
 
-          getDocsOnPrimaryAndReplica maxDocCount = do
-            primaryDocs <- callApi primary "GET" "/synctest/testdoc/_search?preference=_primary" [ object
-                  [ "query" .= object ["match_all" .= object []]
-                  , "size"  .= (1 + maxDocCount)
-                  ]]
-            replicaDocs <- callApi replica "GET" "/synctest/testdoc/_search?preference=_replica" [ object
-                  [ "query" .= object ["match_all" .= object []]
-                  , "size"  .= (1 + maxDocCount)
-                  ]]
-            return (primaryDocs, replicaDocs)
+      writeLog currentRun $ "unpausing link between " ++ nodeName master ++ " and " ++ nodeName replica
+      unpauseLink master replica
 
-      timeoutResult <- timeout 120000000 $ retryOnNodes $ \n -> do
-        void $ callApi n "GET" "/_tasks?detailed" []
-        shardDocCounts <- getShardDocCounts n
-        liftIO $ writeLog n $ "doc counts per node: " ++ show shardDocCounts
-        case shardDocCounts of
-          [(_, docCount1), (_, docCount2)]
-            | docCount1 == docCount2 -> liftIO $ writeLog n "shards have matching doc counts"
-            | otherwise -> do
-                liftIO $ writeLog n "shards have non-matching doc counts"
-                void $ callApi primary "POST" "/_refresh" []
-                void (callApi primary "GET" "/_cat/shards" []) `catchError` (\_ -> return ())
-                void $ getDocsOnPrimaryAndReplica (max docCount1 docCount2)
-                throwError $ "found mis-matching doc-counts: " ++ show shardDocCounts
-          _ -> throwError $ "did not find doc counts: " ++ show shardDocCounts
+      forM_ masterBackups $ \mb -> do
+        writeLog currentRun $ "unpausing link between " ++ nodeName master ++ " and " ++ nodeName mb
+        unpauseLink master mb
+        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName mb
+        unpauseLink primary mb
 
-      case timeoutResult of
-        Just () -> return (return ())
-        Nothing -> do
-          writeLog currentRun "timed out waiting for shards to have matching doc counts"
-          bailOutOnTimeout 30000000 $ retryOnNodes $ \n -> do
-            shardDocCounts <- getShardDocCounts n
-            let maxDocCount = maximum $ 0 : map snd shardDocCounts
-            (primaryResult, replicaResult) <- getDocsOnPrimaryAndReplica maxDocCount
-            let docIdsFromResult result = HM.fromList [(docId, ()) | docId <- result ^.. key "hits" . key "hits" . values . key "_source" . key "serial" . _Integer]
-                primaryDocIds = docIdsFromResult primaryResult
-                replicaDocIds = docIdsFromResult replicaResult
-                primaryNotReplica = HM.difference primaryDocIds replicaDocIds
-                replicaNotPrimary = HM.difference replicaDocIds primaryDocIds
-            liftIO $ writeLog n $ "doc ids on primary but not replica: " ++ show (sort [docId | docId <- HM.keys primaryNotReplica])
-            liftIO $ writeLog n $ "doc ids on replica but not primary: " ++ show (sort [docId | docId <- HM.keys replicaNotPrimary])
-          return $ do
-            callProcessNoThrow (NoContext putStrLn) "bash" ["-c", "tar vc output | xz > " ++ crName currentRun ++ ".tar.xz"]
-            exitWith (ExitFailure 1)
+      return (return ())
 
 data GeneratorState = GeneratorState
   { gsNextSerial  :: Int
