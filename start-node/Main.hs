@@ -85,14 +85,16 @@ withCurrentRun go = do
     writeLog logContext $ "Starting run with working directory: " ++ workingDirectory
     logGitVersion logContext
 
-    withDockerNetwork logContext $ \dockerNetwork -> go CurrentRun
-      { crName             = runName
-      , crWorkingDirectory = workingDirectory
-      , crWriteLog         = writeLog logContext
-      , crWriteApiLog      = writeApiLog
-      , crHttpManager      = manager
-      , crDockerNetwork    = dockerNetwork
-      }
+    withDockerNetwork logContext $ \dockerNetwork ->
+      let currentRun = CurrentRun
+            { crName             = runName
+            , crWorkingDirectory = workingDirectory
+            , crWriteLog         = writeLog logContext
+            , crWriteApiLog      = writeApiLog
+            , crHttpManager      = manager
+            , crDockerNetwork    = dockerNetwork
+            }
+      in withTcpdump currentRun (workingDirectory </> "tcpdump.cap") $ go currentRun
 
 data NodeConfig = NodeConfig
   { ncCurrentRun           :: CurrentRun
@@ -145,6 +147,7 @@ sourceConfig nc = mapM_ yieldString
   , "logger.org.elasticsearch.cluster.service: DEBUG"
   , "logger.org.elasticsearch.indices.recovery: TRACE"
   , "logger.org.elasticsearch.index.shard: TRACE"
+  , "logger.org.elasticsearch.transport: DEBUG"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -206,7 +209,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", dockerNetworkId $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:6.1.2"
+             , "docker.elastic.co/elasticsearch/elasticsearch:6.2.3"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
@@ -442,59 +445,40 @@ main = join $ withCurrentRun $ \currentRun -> do
 
           return (masterNode, primaryNode, replicaNode)
 
+        withPausedLink n1 n2 go = bracket setup teardown $ const go
+          where
+          setup = do
+            writeLog currentRun $ "pausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
+            pauseLink n1 n2
+
+          teardown () = do
+            writeLog currentRun $ "unpausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
+            unpauseLink n1 n2
+
     do
       (master, primary, replica) <- getNodeIdentities
       writeLog master  "is master"
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      let masterBackups@[masterBackup1, masterBackup2] = [ n | n <- nodes, ncIsMasterEligibleNode (esnConfig n), ncName (esnConfig n) /= ncName (esnConfig master) ]
-      writeLog masterBackup1 "is master backup"
-      writeLog masterBackup2 "is master backup"
+      void $ runExceptT $ callApi primary "GET" "/_stats?level=shards" []
 
-      writeLog currentRun $ "breaking link between " ++ nodeName primary ++ " and " ++ nodeName replica
-      breakLink primary replica
+      withPausedLink primary replica $ do
 
-      writeLog currentRun $ "pausing link between " ++ nodeName master ++ " and " ++ nodeName replica
-      pauseLink master replica
-
-      forM_ masterBackups $ \mb -> do
-        writeLog currentRun $ "pausing link between " ++ nodeName master ++ " and " ++ nodeName mb
-        pauseLink master mb
-        writeLog currentRun $ "pausing link between " ++ nodeName primary ++ " and " ++ nodeName mb
-        pauseLink primary mb
-
-      let indexDoc = do
-            threadDelay 1000000
-            writeLog primary "indexing document"
-            void $ runExceptT $ callApi primary "PUT" "/synctest/testdoc/testid" [object[]]
-            writeLog primary "indexing document finished"
-
-      withAsync indexDoc $ \indexDocAsync -> do
-        threadDelay 500000
-        iptablesDrop "-D" master masterBackup1
         threadDelay 1000000
-        iptablesDrop "-I" master masterBackup1
-        threadDelay 500000
-        iptablesDrop "-D" masterBackup1 master
+        writeLog primary "indexing document"
+        void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
+        writeLog primary "indexing document finished"
+
+        threadDelay 1000000000
+
+      forM_ [1..10] $ \n -> do
         threadDelay 1000000
-        iptablesDrop "-I" masterBackup1 master
+        writeLog primary ("indexing document " ++ show (n :: Int))
+        void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
+        writeLog primary "indexing document finished"
 
-        wait indexDocAsync
-
-      threadDelay 100000000
-
-      writeLog currentRun $ "unbreaking link between " ++ nodeName primary ++ " and " ++ nodeName replica
-      unbreakLink primary replica
-
-      writeLog currentRun $ "unpausing link between " ++ nodeName master ++ " and " ++ nodeName replica
-      unpauseLink master replica
-
-      forM_ masterBackups $ \mb -> do
-        writeLog currentRun $ "unpausing link between " ++ nodeName master ++ " and " ++ nodeName mb
-        unpauseLink master mb
-        writeLog currentRun $ "unpausing link between " ++ nodeName primary ++ " and " ++ nodeName mb
-        unpauseLink primary mb
+      void $ runExceptT $ callApi primary "GET" "/_stats?level=shards" []
 
       return (return ())
 

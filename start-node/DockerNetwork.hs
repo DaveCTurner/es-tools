@@ -1,7 +1,10 @@
+{-# LANGUAGE LambdaCase #-}
+
 module DockerNetwork 
   ( DockerNetwork
   , dockerNetworkId
   , withDockerNetwork
+  , withTcpdump
   ) where
 
 import LogContext
@@ -9,7 +12,11 @@ import System.Exit
 import Control.Exception
 import Control.Concurrent (threadDelay)
 import System.Process
+import System.Process.Internals
 import Process
+import Data.Streaming.Process
+import System.Posix.Signals
+import System.Timeout
 
 newtype DockerNetwork = DockerNetwork String
   deriving (Show, Eq)
@@ -46,3 +53,26 @@ withDockerNetwork logContext go = bracket
   (dockerNetworkRemove logContext) $ \dockerNetwork -> do
     writeLog logContext $ "Using docker network " ++ dockerNetworkId dockerNetwork
     go dockerNetwork
+
+withTcpdump :: LogContext lc => lc -> String -> IO a -> IO a
+withTcpdump logContext fileName go = bracket setup teardown $ const go
+  where
+  cmd = "sudo tcpdump -i elasticnet -s65535 -w" ++ fileName
+  setup = do
+    writeLog logContext $ "Starting " ++ cmd
+    (Inherited, Inherited, Inherited, sph) <- streamingProcess (shell cmd)
+    return sph
+
+  teardown sph = do
+    writeLog logContext $ "Killing tcpdump"
+    maybeExitCode <- timeout 5000000 $ do
+      withProcessHandle (streamingProcessHandleRaw sph) $ \case
+        OpenHandle pid -> do
+          writeLog logContext $ "Sending SIGTERM to pid " ++ show pid
+          signalProcess sigTERM pid
+        _ -> return ()
+      waitForStreamingProcess sph
+    writeLog logContext $ "Killing tcpdump resulted in " ++ show maybeExitCode
+      
+
+
