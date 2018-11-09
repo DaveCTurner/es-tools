@@ -148,6 +148,7 @@ sourceConfig nc = mapM_ yieldString
   , "logger.org.elasticsearch.indices.recovery: TRACE"
   , "logger.org.elasticsearch.index.shard: TRACE"
   , "logger.org.elasticsearch.transport: DEBUG"
+  , "logger.org.elasticsearch.transport.netty4.Netty4Transport: TRACE"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -209,7 +210,7 @@ runNode nodeConfig = do
              , "--mount", "type=bind,source=" ++ configDirectory nodeConfig </> "elasticsearch.yml" ++ ",target=/usr/share/elasticsearch/config/elasticsearch.yml"
              , "--network", dockerNetworkId $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
-             , "docker.elastic.co/elasticsearch/elasticsearch:6.2.3"
+             , "docker.elastic.co/elasticsearch/elasticsearch:6.3.0"
              ]
 
   writeLog nodeConfig $ "executing: docker " ++ unwords args
@@ -400,6 +401,7 @@ main = join $ withCurrentRun $ \currentRun -> do
             [ "index" .= object
               [ "number_of_shards"   .= Number 1
               , "number_of_replicas" .= Number 1
+              , "unassigned.node_left.delayed_timeout" .= Number 0
               ]
             ]
           , "mappings" .= object
@@ -463,22 +465,24 @@ main = join $ withCurrentRun $ \currentRun -> do
 
       void $ runExceptT $ callApi primary "GET" "/_stats?level=shards" []
 
-      withPausedLink primary replica $ do
+      withPausedLink master primary $ do
 
-        threadDelay 1000000
-        writeLog primary "indexing document"
-        void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
-        writeLog primary "indexing document finished"
+        writeLog primary "killing primary"
+        signalNode primary "KILL"
+        void $ atomically $ awaitExit primary
+        writeLog primary "primary killed"
 
-        threadDelay 1000000000
+        newPrimary <- runNode (esnConfig primary) { ncBindHost = "10.10.10.199" }
+        result <- atomically $ awaitStarted newPrimary
+        writeLog newPrimary $ if result then "started successfully" else "did not start successfully"
 
-      forM_ [1..10] $ \n -> do
-        threadDelay 1000000
-        writeLog primary ("indexing document " ++ show (n :: Int))
-        void $ runExceptT $ callApi primary "POST" "/synctest/testdoc" [object[]]
-        writeLog primary "indexing document finished"
-
-      void $ runExceptT $ callApi primary "GET" "/_stats?level=shards" []
+        bracket (return [newPrimary]) killRemainingNodes $ \_ -> do 
+          threadDelay 10000000
+          (master', primary', replica') <- getNodeIdentities
+          writeLog master'  "is master"
+          writeLog primary' "is primary"
+          writeLog replica' "is replica"
+          threadDelay 2000000
 
       return (return ())
 
