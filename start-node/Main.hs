@@ -141,6 +141,7 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
   , "xpack.ml.enabled: false"
+  , "logger.org.elasticsearch.transport: TRACE"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -462,9 +463,10 @@ main = join $ withCurrentRun $ \currentRun -> do
 
       forever $ do
         withAsync (forever $ indexDocs primary) $ \_ -> do
-          threadDelay 1000000
+          threadDelay $ 1000 * 1000
           withPausedLink primary replica $ do
             threadDelay $ 6 * 1000 * 1000
+          threadDelay $ 10 * 1000 * 1000
 
         writeLog currentRun "waiting for bulk tasks to finish"
 
