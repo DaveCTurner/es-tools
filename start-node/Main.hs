@@ -37,14 +37,12 @@ import System.Exit
 import System.FilePath
 import System.IO
 import System.Process.Internals
-import System.Random
 import System.Timeout
 import Text.Printf
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
-import qualified Data.Sequence as Seq
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
@@ -462,109 +460,22 @@ main = join $ withCurrentRun $ \currentRun -> do
       writeLog primary "is primary"
       writeLog replica "is replica"
 
-      let loop iterNum = do
-            withAsync (forever $ indexDocs primary) $ \_ -> do
-              threadDelay 1000000
-              withPausedLink primary replica $ do
-                threadDelay $ 6 * 1000 * 1000
+      forever $ do
+        withAsync (forever $ indexDocs primary) $ \_ -> do
+          threadDelay 1000000
+          withPausedLink primary replica $ do
+            threadDelay $ 6 * 1000 * 1000
 
-            writeLog currentRun "waiting for bulk tasks to finish"
+        writeLog currentRun "waiting for bulk tasks to finish"
 
-            bailOutOnTimeout (60 * 1000 * 1000) $ let
-              go = do
-                allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
-                case allTasksOrError of
-                  Left _ -> threadDelay 100000 >> go
-                  Right v -> do
-                    let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
-                    if any (T.isPrefixOf "indices:data/write/bulk") actions
-                      then threadDelay 100000 >> go
-                      else writeLog master $ show actions
-              in go
-
-            when (iterNum < 10) $ loop (iterNum+1 :: Int)
-      loop 0
-
-      return (return ())
-
-data GeneratorState = GeneratorState
-  { gsNextSerial  :: Int
-  , gsCurrentDocs :: Seq.Seq Int
-  , gsRng         :: StdGen
-  }
-
-data Action = CreateDoc !Int | UpdateDoc !Int !Int | DeleteDoc !Int deriving (Show, Eq)
-
-encodeAction :: Action -> [Value]
-encodeAction (CreateDoc docId) =
-  [ object ["index" .= object ["_id" .= docId]]
-  , object ["serial" .= docId, "updated" .= docId]
-  ]
-encodeAction (UpdateDoc docId actId) =
-  [ object ["update" .= object ["_id" .= docId]]
-  , object ["doc" .= object ["serial" .= docId, "updated" .= actId]]
-  ]
-encodeAction (DeleteDoc docId) =
-  [ object ["delete" .= object ["_id" .= docId]]
-  ]
-
-withTrafficGenerator :: [ElasticsearchNode] -> IO a -> IO a
-withTrafficGenerator allNodes go = do
-  rng <- getStdGen
-  stateVar <- newTVarIO $ GeneratorState 0 Seq.empty rng
-  let logStart = forM_ allNodes $ \n -> writeLog n "withTrafficGenerator: starting"
-      logEnd   = forM_ allNodes $ \n -> writeLog n "withTrafficGenerator: finished"
-      spawnGenerators [] = go `finally` logEnd
-      spawnGenerators (n:ns) = withAsync (generateTrafficTo n stateVar) $ \_ -> spawnGenerators ns
-  logStart
-  spawnGenerators $ concat $ replicate 20 allNodes
-
-generateTrafficTo :: ElasticsearchNode -> TVar GeneratorState -> IO ()
-generateTrafficTo node stateVar = forever $ do
-    actions <- replicateM 1000 $ atomically $ do
-      actionId <- nextSerial
-      docs <- gsCurrentDocs <$> readTVar stateVar
-      let currentDocCount = Seq.length docs
-      let maxPosition = max currentDocCount 10000
-      position <- withRng $ randomR (0, maxPosition)
-      if position < currentDocCount
-        then do
-          let docId = Seq.index docs position
-          shouldDelete <- (< 0.2) <$> withRng (randomR (0.0, 1.0 :: Double))
-          if shouldDelete
-            then deleteDoc position docId
-            else return $! UpdateDoc docId actionId
-
-        else createDoc actionId
-
-    void $ runExceptT $ callApi node "POST" "/synctest/testdoc/_bulk" $ concatMap encodeAction actions
-
-  where
-
-  nextSerial :: STM Int
-  nextSerial = do
-    gs <- readTVar stateVar
-    let n = gsNextSerial gs
-    writeTVar stateVar $ gs { gsNextSerial = n + 1}
-    return n
-
-  withRng f = do
-    gs <- readTVar stateVar
-    let (a, rng') = f (gsRng gs)
-    writeTVar stateVar gs { gsRng = rng' }
-    return a
-
-  updateCurrentDocs f = modifyTVar stateVar $ \gs -> gs { gsCurrentDocs = f $ gsCurrentDocs gs }
-
-  createDoc docId = do
-    updateCurrentDocs (Seq.|> docId)
-    return $! CreateDoc docId
-
-  deleteDoc position docId = do
-    updateCurrentDocs (deleteSeqElemAt position)
-    return $! DeleteDoc docId
-
-deleteSeqElemAt :: Int -> Seq.Seq a -> Seq.Seq a
-deleteSeqElemAt i xs = before <> Seq.drop 1 notBefore
-  where
-  (before, notBefore) = Seq.splitAt i xs
+        bailOutOnTimeout (2 * 60 * 1000 * 1000) $ let
+          go = do
+            allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
+            case allTasksOrError of
+              Left _ -> threadDelay 500000 >> go
+              Right v -> do
+                let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
+                if any (T.isPrefixOf "indices:data/write/bulk") actions
+                  then threadDelay 500000 >> go
+                  else writeLog master $ "no more bulk tasks: " ++ show actions
+          in go
