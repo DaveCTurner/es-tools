@@ -489,9 +489,10 @@ main = join $ withCurrentRun $ \currentRun -> do
 
     bailOutOnTimeout (2 * 60 * 1000 * 1000) $ let
       go = do
+        void $ runExceptT $ callApi master "GET" "/_cluster/pending_tasks" []
         allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
         case allTasksOrError of
-          Left _ -> threadDelay 500000 >> go
+          Left _ -> threadDelay 1000000 >> go
           Right v -> do
             let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
                 uniqueActions = HS.toList $ HS.fromList actions
