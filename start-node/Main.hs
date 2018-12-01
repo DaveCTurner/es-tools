@@ -37,6 +37,7 @@ import System.Exit
 import System.FilePath
 import System.IO
 import System.Process.Internals
+import System.Random
 import System.Timeout
 import Text.Printf
 import qualified Data.ByteString as B
@@ -141,7 +142,7 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
   , "xpack.ml.enabled: false"
-  , "logger.org.elasticsearch.transport: TRACE"
+  --, "logger.org.elasticsearch.transport: TRACE"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -311,6 +312,7 @@ runIptables args action n1 n2 =
                        , "--source",      ncBindHost (esnConfig n1)
                        , "--destination", ncBindHost (esnConfig n2)
                        , "--protocol", "tcp"
+                       , "--wait"
                        ] ++ args
 
 iptablesReject :: String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
@@ -350,7 +352,7 @@ main = join $ withCurrentRun $ \currentRun -> do
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
             }
-          | nodeIndex <- [1..5] :: [Int]
+          | nodeIndex <- [1..6] :: [Int]
           , let isMaster = nodeIndex <= 3
           ]
 
@@ -393,13 +395,8 @@ main = join $ withCurrentRun $ \currentRun -> do
       createIndexResult <- callApi n "PUT" "/i" [object
           [ "settings" .= object
             [ "index" .= object
-              [ "number_of_shards"   .= Number 1
-              , "number_of_replicas" .= Number 1
-              ]
-            ]
-          , "mappings" .= object
-            [ "_doc" .= object
-              [ "properties" .= object []
+              [ "number_of_shards"   .= Number 3
+              , "number_of_replicas" .= Number 2
               ]
             ]
           ]
@@ -428,17 +425,7 @@ main = join $ withCurrentRun $ \currentRun -> do
 
           masterNode <- getUniqueNode "master" $ nodesFromIds $ state ^.. key "master_node" . _String
 
-          let shardCopyNodeIds =
-                [ (nodeId, isPrimary)
-                | routingTableEntry <- state ^.. key "routing_table" . key "indices" . key "i" . key "shards" . key "0" . values
-                , nodeId    <- routingTableEntry ^.. key "node" . _String
-                , isPrimary <- routingTableEntry ^.. key "primary" . _Bool
-                ]
-
-          primaryNode <- getUniqueNode "primary" $ nodesFromIds [nid | (nid, True)  <- shardCopyNodeIds]
-          replicaNode <- getUniqueNode "replica" $ nodesFromIds [nid | (nid, False) <- shardCopyNodeIds]
-
-          return (masterNode, primaryNode, replicaNode)
+          return masterNode
 
         withPausedLink n1 n2 go = bracket setup teardown $ const go
           where
@@ -450,34 +437,65 @@ main = join $ withCurrentRun $ \currentRun -> do
             writeLog currentRun $ "unpausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
             unpauseLink n1 n2
 
-        indexDocs n = runExceptT $ callApi n "POST" "/i/_doc/_bulk" $ take 20 $ cycle
-            [ object [ "index" .= object[] ]
-            , object [ ]
-            ]
+    master <- getNodeIdentities
+    writeLog master  "is master"
 
-    do
-      (master, primary, replica) <- getNodeIdentities
-      writeLog master  "is master"
-      writeLog primary "is primary"
-      writeLog replica "is replica"
+    {-
+        * index docs to each node (generating fields => mapping updates, including updates, deletes)
+        * pause/unpause links between each pair of nodes
+    -}
 
-      forever $ do
-        withAsync (forever $ indexDocs primary) $ \_ -> do
-          threadDelay $ 1000 * 1000
-          withPausedLink primary replica $ do
-            threadDelay $ 6 * 1000 * 1000
-          threadDelay $ 10 * 1000 * 1000
+    let indexers = map makeIndexer $ concat $ replicate 2 nodes
+          where
+          makeIndexer :: ElasticsearchNode -> IO ()
+          makeIndexer node = forever $ do
+            ops <- replicateM 20 randomOp
+            runExceptT $ callApi node "POST" "/i/_doc/_bulk" $ concat ops
 
-        writeLog currentRun "waiting for bulk tasks to finish"
+        randomOp = do
+          indexOrDelete <- randomIO
+          docIdNum      <- randomRIO (1000, 9999) :: IO Int
+          let bulkAction = object [ "_id" .= T.pack ("doc" ++ show docIdNum) ]
 
-        bailOutOnTimeout (2 * 60 * 1000 * 1000) $ let
-          go = do
-            allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
-            case allTasksOrError of
-              Left _ -> threadDelay 500000 >> go
-              Right v -> do
-                let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
-                if any (T.isPrefixOf "indices:data/write/bulk") actions
-                  then threadDelay 500000 >> go
-                  else writeLog master $ "no more bulk tasks: " ++ show actions
-          in go
+          if indexOrDelete
+            then do
+              fieldNum <- randomRIO (10, 99) :: IO Int
+              let fieldName = T.pack $ "fld" ++ show fieldNum
+              return [ object [ "index" .= bulkAction ]
+                     , object [ fieldName .= String "blah" ]
+                     ]
+            else return [ object [ "delete" .= bulkAction ] ]
+
+        networkDisruptors = map makeNetworkDisruptor
+          [ (node1, node2)
+          | node1 <- nodes
+          , node2 <- nodes
+          , nodeName (esnConfig node1) < nodeName (esnConfig node2)
+          ]
+          where
+          randomDelay = threadDelay =<< randomRIO (10 * 1000, 1000 * 1000)
+          makeNetworkDisruptor (node1, node2) = forever $ do
+            randomDelay
+            withPausedLink node1 node2 randomDelay
+
+        withAsyncs :: [IO ()] -> IO a -> IO a
+        withAsyncs [] go = go
+        withAsyncs (action:actions) go = withAsync action $ \_ -> withAsyncs actions go
+
+    withAsyncs (indexers ++ networkDisruptors) $ threadDelay $ 60 * 1000 * 1000
+            
+    writeLog currentRun "waiting for bulk tasks to finish"
+
+    bailOutOnTimeout (2 * 60 * 1000 * 1000) $ let
+      go = do
+        allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
+        case allTasksOrError of
+          Left _ -> threadDelay 500000 >> go
+          Right v -> do
+            let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
+            if any (T.isPrefixOf "indices:data/write/bulk") actions
+              then threadDelay 500000 >> go
+              else writeLog master $ "no more bulk tasks: " ++ show actions
+      in go
+
+    return (return ())
