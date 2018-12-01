@@ -44,6 +44,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
@@ -130,7 +131,7 @@ sourceConfig :: Monad m => NodeConfig -> Producer m B.ByteString
 sourceConfig nc = mapM_ yieldString
   [ "cluster.name: " ++ crName (ncCurrentRun nc)
   , "node.name: " ++ ncName nc
-  , "discovery.zen.minimum_master_nodes: 2"
+  , "discovery.zen.minimum_master_nodes: 1"
   , "discovery.zen.fd.ping_timeout: 2s"
   , "node.data: " ++ if ncIsDataNode nc then "true" else "false"
   , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
@@ -352,8 +353,8 @@ main = join $ withCurrentRun $ \currentRun -> do
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
             }
-          | nodeIndex <- [1..6] :: [Int]
-          , let isMaster = nodeIndex <= 3
+          | nodeIndex <- [1..3] :: [Int]
+          , let isMaster = nodeIndex <= 1
           ]
 
       killRemainingNodes nodes = do
@@ -395,8 +396,8 @@ main = join $ withCurrentRun $ \currentRun -> do
       createIndexResult <- callApi n "PUT" "/i" [object
           [ "settings" .= object
             [ "index" .= object
-              [ "number_of_shards"   .= Number 3
-              , "number_of_replicas" .= Number 2
+              [ "number_of_shards"   .= Number 1
+              , "number_of_replicas" .= Number 1
               ]
             ]
           ]
@@ -482,7 +483,7 @@ main = join $ withCurrentRun $ \currentRun -> do
         withAsyncs [] go = go
         withAsyncs (action:actions) go = withAsync action $ \_ -> withAsyncs actions go
 
-    withAsyncs (indexers ++ networkDisruptors) $ threadDelay $ 60 * 1000 * 1000
+    withAsyncs (indexers ++ networkDisruptors) $ threadDelay $ 10 * 1000 * 1000
             
     writeLog currentRun "waiting for bulk tasks to finish"
 
@@ -493,9 +494,10 @@ main = join $ withCurrentRun $ \currentRun -> do
           Left _ -> threadDelay 500000 >> go
           Right v -> do
             let actions = v ^.. key "nodes" . members . key "tasks" . members . key "action" . _String
-            if any (T.isPrefixOf "indices:data/write/bulk") actions
+                uniqueActions = HS.toList $ HS.fromList actions
+            if any (T.isPrefixOf "indices:data/write/bulk") uniqueActions
               then threadDelay 500000 >> go
-              else writeLog master $ "no more bulk tasks: " ++ show actions
+              else writeLog master $ "no more bulk tasks: " ++ show uniqueActions
       in go
 
     return (return ())
