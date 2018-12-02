@@ -206,6 +206,9 @@ runNode nodeConfig = do
              , "--network", dockerNetworkId $ crDockerNetwork $ ncCurrentRun nodeConfig
              , "--ip", ncBindHost nodeConfig
              , "--sysctl", "net.ipv4.tcp_retries2=4"
+             , "--sysctl", "net.ipv4.tcp_keepalive_time=5"
+             , "--sysctl", "net.ipv4.tcp_keepalive_intvl=5"
+             , "--sysctl", "net.ipv4.tcp_keepalive_probes=3"
              , "docker.elastic.co/elasticsearch/elasticsearch:6.4.2"
              ]
 
