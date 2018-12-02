@@ -143,7 +143,7 @@ sourceConfig nc = mapM_ yieldString
   , "xpack.monitoring.enabled: false"
   , "xpack.watcher.enabled: false"
   , "xpack.ml.enabled: false"
-  --, "logger.org.elasticsearch.transport: TRACE"
+  , "logger.org.elasticsearch.transport: TRACE"
   ]
 
 yieldString :: Monad m => String -> Producer m B.ByteString
@@ -490,7 +490,7 @@ main = join $ withCurrentRun $ \currentRun -> do
     bailOutOnTimeout (2 * 60 * 1000 * 1000) $ let
       go = do
         void $ runExceptT $ callApi master "GET" "/_cluster/pending_tasks" []
-        allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks" []
+        allTasksOrError <- runExceptT $ callApi master "GET" "/_tasks?detailed" []
         case allTasksOrError of
           Left _ -> threadDelay 1000000 >> go
           Right v -> do
