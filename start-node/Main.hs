@@ -61,7 +61,7 @@ logGitVersion logContext = do
 
 withCurrentRun :: (CurrentRun -> IO a) -> IO a
 withCurrentRun go = do
-  runName <- formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
+  runName <- take 27 . formatTime defaultTimeLocale "%Y-%m-%d--%H-%M-%S.%q" <$> getCurrentTime
   cwd <- getCurrentDirectory
   let workingDirectory = cwd </> "output" </> runName
   createElasticDirectory putStrLn workingDirectory
