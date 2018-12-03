@@ -14,6 +14,7 @@ import Process
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens hiding ((.=))
@@ -85,6 +86,9 @@ withCurrentRun go = do
     writeLog logContext $ "Starting run with working directory: " ++ workingDirectory
     logGitVersion logContext
 
+    iptablesLock <- newMVar ()
+    let withIptablesLock = withMVar iptablesLock . const
+
     withDockerNetwork logContext $ \dockerNetwork ->
       let currentRun = CurrentRun
             { crName             = runName
@@ -93,6 +97,7 @@ withCurrentRun go = do
             , crWriteApiLog      = writeApiLog
             , crHttpManager      = manager
             , crDockerNetwork    = dockerNetwork
+            , crWithIptablesLock = withIptablesLock
             }
       in withTcpdump currentRun (workingDirectory </> "tcpdump.cap") $ go currentRun
 
@@ -182,10 +187,10 @@ checkStarted onStarted = awaitForever $ \bs ->
   else yield bs
 
 data ElasticsearchNode = ElasticsearchNode
-  { esnConfig    :: NodeConfig
-  , esnHandle    :: StreamingProcessHandle
-  , esnIsStarted :: STM Bool
-  , esnThread    :: Async ExitCode
+  { esnConfig       :: NodeConfig
+  , esnHandle       :: StreamingProcessHandle
+  , esnIsStarted    :: STM Bool
+  , esnThread       :: Async ExitCode
   }
 
 instance LogContext  ElasticsearchNode where writeLog = writeLog . esnConfig
@@ -311,13 +316,14 @@ bothWays :: Applicative m => (ElasticsearchNode -> ElasticsearchNode -> m ()) ->
 bothWays go n1 n2 = (<>) <$> go n1 n2 <*> go n2 n1
 
 runIptables :: [String] -> String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
-runIptables args action n1 n2 = 
+runIptables args action n1 n2 = withIptablesLock $
   callProcess "sudo" $ [ "iptables", action, "DOCKER-USER"
                        , "--source",      ncBindHost (esnConfig n1)
                        , "--destination", ncBindHost (esnConfig n2)
                        , "--protocol", "tcp"
                        , "--wait"
                        ] ++ args
+  where withIptablesLock = crWithIptablesLock $ ncCurrentRun $ esnConfig n1
 
 iptablesReject :: String -> ElasticsearchNode -> ElasticsearchNode -> IO ()
 iptablesReject = runIptables ["--jump", "REJECT", "--reject-with", "tcp-reset"]

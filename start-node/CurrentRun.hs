@@ -1,3 +1,5 @@
+{-# LANGUAGE Rank2Types #-}
+
 module CurrentRun where
 
 import LogContext
@@ -13,6 +15,7 @@ data CurrentRun = CurrentRun
   , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
   , crHttpManager      :: Manager
   , crDockerNetwork    :: DockerNetwork
+  , crWithIptablesLock :: forall a. IO a -> IO a
   }
 
 instance LogContext CurrentRun where
