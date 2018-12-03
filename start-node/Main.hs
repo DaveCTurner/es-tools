@@ -445,7 +445,8 @@ main = join $ withCurrentRun $ \currentRun -> do
 
           return masterNode
 
-        withPausedLink n1 n2 go = bracket setup teardown $ const go
+        -- uninterruptibleMask is necessary because running an external process is interruptible, so without it sometimes cleanup doesn't run
+        withPausedLink n1 n2 go = uninterruptibleMask $ \restore -> bracket setup teardown $ const $ restore go
           where
           setup = do
             writeLog currentRun $ "pausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
