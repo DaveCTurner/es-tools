@@ -450,10 +450,12 @@ main = join $ withCurrentRun $ \currentRun -> do
           setup = do
             writeLog currentRun $ "pausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
             pauseLink n1 n2
+            writeLog currentRun $ "paused link between " ++ nodeName n1 ++ " and " ++ nodeName n2
 
           teardown () = do
             writeLog currentRun $ "unpausing link between " ++ nodeName n1 ++ " and " ++ nodeName n2
             unpauseLink n1 n2
+            writeLog currentRun $ "unpaused link between " ++ nodeName n1 ++ " and " ++ nodeName n2
 
     master <- getNodeIdentities
     writeLog master  "is master"
