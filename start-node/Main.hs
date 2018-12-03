@@ -136,7 +136,7 @@ sourceConfig :: Monad m => NodeConfig -> Producer m B.ByteString
 sourceConfig nc = mapM_ yieldString
   [ "cluster.name: " ++ crName (ncCurrentRun nc)
   , "node.name: " ++ ncName nc
-  , "discovery.zen.minimum_master_nodes: 1"
+  , "discovery.zen.minimum_master_nodes: 2"
   , "discovery.zen.fd.ping_timeout: 2s"
   , "node.data: " ++ if ncIsDataNode nc then "true" else "false"
   , "node.master: " ++ if ncIsMasterEligibleNode nc then "true" else "false"
@@ -362,8 +362,8 @@ main = join $ withCurrentRun $ \currentRun -> do
                                        | nc <- nodeConfigs
                                        , ncIsMasterEligibleNode nc]
             }
-          | nodeIndex <- [1..3] :: [Int]
-          , let isMaster = nodeIndex <= 1
+          | nodeIndex <- [1..5] :: [Int]
+          , let isMaster = nodeIndex <= 3
           ]
 
       killRemainingNodes nodes = do
