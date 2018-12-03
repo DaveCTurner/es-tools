@@ -76,9 +76,9 @@ withCurrentRun go = do
           putStrLn fullMsg
           hPutStrLn h fullMsg
 
-        writeApiLog method url request response = withLogHandle apiLog $ \h -> do
+        writeApiLog requestId method url request response = withLogHandle apiLog $ \h -> do
           now <- formatISO8601Micros <$> getCurrentTime
-          hPutStrLn h $ printf "[%s] %s %s" now (show method) url
+          hPutStrLn h $ printf "[%s] [%d] %s %s" now requestId (show method) url
           BL.hPut h $ request <> BL.singleton 0x0a <> response <> BL.pack [0x0a, 0x0a]
 
     manager <- newManager defaultManagerSettings
@@ -89,6 +89,9 @@ withCurrentRun go = do
     iptablesLock <- newMVar ()
     let withIptablesLock = withMVar iptablesLock . const
 
+    requestIdVar <- newMVar 0
+    let nextId = modifyMVar requestIdVar (\n -> let n' = n + 1 in n' `seq` return (n', n))
+
     withDockerNetwork logContext $ \dockerNetwork ->
       let currentRun = CurrentRun
             { crName             = runName
@@ -98,6 +101,7 @@ withCurrentRun go = do
             , crHttpManager      = manager
             , crDockerNetwork    = dockerNetwork
             , crWithIptablesLock = withIptablesLock
+            , crNextId           = nextId
             }
       in withTcpdump currentRun (workingDirectory </> "tcpdump.cap") $ go currentRun
 
@@ -301,10 +305,14 @@ callApi node verb path reqBody = do
         }
       manager = crHttpManager $ ncCurrentRun $ esnConfig node
 
-      go = withResponse req manager $ \response -> do
-        fullResponse <- BL.fromChunks <$> brConsume (responseBody response)
-        crWriteApiLog (ncCurrentRun $ esnConfig node) verb requestUri reqBodyBytes fullResponse
-        return $ eitherDecode fullResponse
+      go = do
+        requestId <- crNextId $ ncCurrentRun $ esnConfig node
+        let logResponse r = crWriteApiLog (ncCurrentRun $ esnConfig node) requestId verb requestUri reqBodyBytes r
+        logResponse "PENDING"
+        withResponse req manager $ \response -> do
+          fullResponse <- BL.fromChunks <$> brConsume (responseBody response)
+          logResponse fullResponse
+          return $ eitherDecode fullResponse
       goSafe = (Right <$> go) `catch` (return . Left)
 
   liftIO goSafe >>= \case

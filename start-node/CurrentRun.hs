@@ -12,10 +12,11 @@ data CurrentRun = CurrentRun
   { crName             :: String
   , crWorkingDirectory :: FilePath
   , crWriteLog         :: String -> IO ()
-  , crWriteApiLog      :: B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
+  , crWriteApiLog      :: Integer -> B.ByteString -> String -> BL.ByteString -> BL.ByteString -> IO ()
   , crHttpManager      :: Manager
   , crDockerNetwork    :: DockerNetwork
   , crWithIptablesLock :: forall a. IO a -> IO a
+  , crNextId           :: IO Integer
   }
 
 instance LogContext CurrentRun where
